@@ -97,6 +97,13 @@ uart_cpu_getdev(int devtype, struct uart_devinfo *di)
 	di->bas.regiowidth = iowidth;
 	di->baudrate = br;
 	di->bas.rclk = rclk;
+	/*
+	 * Without a clock-frequency property, the firmware that used this
+	 * console has programmed it for the stated baudrate, so infer the
+	 * rclk from the divisor rather than assuming the default.
+	 */
+	if (rclk == 0)
+		di->bas.rclk_guess = 1;
 	di->ops = uart_getops(class);
 	di->databits = 8;
 	di->stopbits = 1;
