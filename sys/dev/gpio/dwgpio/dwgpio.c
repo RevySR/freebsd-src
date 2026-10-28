@@ -133,7 +133,7 @@ dwgpio_attach(device_t dev)
 {
 	struct dwgpio_softc *sc;
 	int version;
-	int nr_pins;
+	pcell_t nr_pins;
 	int cfg2;
 	int i;
 
@@ -152,11 +152,25 @@ dwgpio_attach(device_t dev)
 	if (boothowto & RB_VERBOSE)
 		device_printf(sc->dev, "Version = 0x%08x\n", version);
 
-	/* Grab number of pins from hardware. */
-	cfg2 = READ4(sc, GPIO_CONFIG_REG2);
-	nr_pins = (cfg2 >> ENCODED_ID_PWIDTH_S(sc->port)) & \
-			ENCODED_ID_PWIDTH_M;
-	sc->gpio_npins = nr_pins + 1;
+	/*
+	 * Prefer the pin count from the device tree. Without it, grab the
+	 * number of pins from hardware, which is only meaningful when the
+	 * controller was configured with encoded parameters.
+	 */
+	if (OF_getencprop(sc->node, "ngpios", &nr_pins,
+	    sizeof(nr_pins)) <= 0 &&
+	    OF_getencprop(sc->node, "snps,nr-gpios", &nr_pins,
+	    sizeof(nr_pins)) <= 0) {
+		cfg2 = READ4(sc, GPIO_CONFIG_REG2);
+		nr_pins = ((cfg2 >> ENCODED_ID_PWIDTH_S(sc->port)) &
+		    ENCODED_ID_PWIDTH_M) + 1;
+	}
+	if (nr_pins == 0 || nr_pins > NR_GPIO_MAX) {
+		device_printf(dev, "invalid number of pins %u\n", nr_pins);
+		mtx_destroy(&sc->sc_mtx);
+		return (ENXIO);
+	}
+	sc->gpio_npins = nr_pins;
 
 	for (i = 0; i < sc->gpio_npins; i++) {
 		sc->gpio_pins[i].gp_pin = i;
