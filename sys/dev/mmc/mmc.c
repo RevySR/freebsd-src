@@ -220,7 +220,8 @@ static int mmc_switch_to_hs200(struct mmc_softc *sc, struct mmc_ivars *ivar,
     uint32_t clock);
 static int mmc_switch_to_hs400(struct mmc_softc *sc, struct mmc_ivars *ivar,
     uint32_t max_dtr, enum mmc_bus_timing max_timing);
-static int mmc_test_bus_width(struct mmc_softc *sc);
+static int mmc_test_bus_width(struct mmc_softc *sc,
+    struct mmc_ivars *ivar);
 static uint32_t mmc_timing_to_dtr(struct mmc_ivars *ivar,
     enum mmc_bus_timing timing);
 static const char *mmc_timing_to_string(enum mmc_bus_timing timing);
@@ -976,104 +977,57 @@ mmc_set_vccq(struct mmc_softc *sc, struct mmc_ivars *ivar,
 		return (MMC_ERR_NONE);
 }
 
-static const uint8_t p8[8] = {
-	0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
-static const uint8_t p8ok[8] = {
-	0xAA, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
-static const uint8_t p4[4] = {
-	0x5A, 0x00, 0x00, 0x00
-};
-
-static const uint8_t p4ok[4] = {
-	0xA5, 0x00, 0x00, 0x00
-};
-
 static int
-mmc_test_bus_width(struct mmc_softc *sc)
+mmc_test_bus_width(struct mmc_softc *sc, struct mmc_ivars *ivar)
 {
-	struct mmc_command cmd;
-	struct mmc_data data;
-	uint8_t buf[8];
-	int err;
+	static const struct {
+		uint32_t cap;
+		enum mmc_bus_width width;
+		uint8_t value;
+	} widths[] = {
+		{ MMC_CAP_8_BIT_DATA, bus_width_8, EXT_CSD_BUS_WIDTH_8 },
+		{ MMC_CAP_4_BIT_DATA, bus_width_4, EXT_CSD_BUS_WIDTH_4 },
+	};
+	uint8_t *ext_csd;
+	enum mmc_bus_width width;
+	int err, i;
 
-	if (mmcbr_get_caps(sc->dev) & MMC_CAP_8_BIT_DATA) {
-		mmcbr_set_bus_width(sc->dev, bus_width_8);
+	/*
+	 * Switch the card to each bus width supported by the host and read
+	 * EXT_CSD back with it.  The width works if the read-only properties
+	 * match those read in 1-bit mode.  This avoids the CMD19/CMD14 bus
+	 * test, which is optional and not reliable with every controller.
+	 */
+	ext_csd = malloc(MMC_EXTCSD_SIZE, M_DEVBUF, M_WAITOK);
+	width = bus_width_1;
+	for (i = 0; i < nitems(widths); i++) {
+		if ((mmcbr_get_caps(sc->dev) & widths[i].cap) == 0)
+			continue;
+		err = mmc_switch(sc->dev, sc->dev, ivar->rca,
+		    EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BUS_WIDTH, widths[i].value,
+		    ivar->cmd6_time, true);
+		if (err != MMC_ERR_NONE)
+			continue;
+		mmcbr_set_bus_width(sc->dev, widths[i].width);
 		mmcbr_update_ios(sc->dev);
-
 		sc->squelched++; /* Errors are expected, squelch reporting. */
-		memset(&cmd, 0, sizeof(cmd));
-		memset(&data, 0, sizeof(data));
-		cmd.opcode = MMC_BUSTEST_W;
-		cmd.arg = 0;
-		cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
-		cmd.data = &data;
-
-		data.data = __DECONST(void *, p8);
-		data.len = 8;
-		data.flags = MMC_DATA_WRITE;
-		mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
-
-		memset(&cmd, 0, sizeof(cmd));
-		memset(&data, 0, sizeof(data));
-		cmd.opcode = MMC_BUSTEST_R;
-		cmd.arg = 0;
-		cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
-		cmd.data = &data;
-
-		data.data = buf;
-		data.len = 8;
-		data.flags = MMC_DATA_READ;
-		err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
+		err = mmc_send_ext_csd(sc->dev, sc->dev, ext_csd);
 		sc->squelched--;
-
 		mmcbr_set_bus_width(sc->dev, bus_width_1);
 		mmcbr_update_ios(sc->dev);
-
-		if (err == MMC_ERR_NONE && memcmp(buf, p8ok, 8) == 0)
-			return (bus_width_8);
+		if (err == MMC_ERR_NONE && memcmp(&ext_csd[EXT_CSD_REV],
+		    &ivar->raw_ext_csd[EXT_CSD_REV],
+		    EXT_CSD_PWR_CL_52_360_DDR - EXT_CSD_REV + 1) == 0) {
+			width = widths[i].width;
+			break;
+		}
 	}
+	free(ext_csd, M_DEVBUF);
 
-	if (mmcbr_get_caps(sc->dev) & MMC_CAP_4_BIT_DATA) {
-		mmcbr_set_bus_width(sc->dev, bus_width_4);
-		mmcbr_update_ios(sc->dev);
-
-		sc->squelched++; /* Errors are expected, squelch reporting. */
-		memset(&cmd, 0, sizeof(cmd));
-		memset(&data, 0, sizeof(data));
-		cmd.opcode = MMC_BUSTEST_W;
-		cmd.arg = 0;
-		cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
-		cmd.data = &data;
-
-		data.data = __DECONST(void *, p4);
-		data.len = 4;
-		data.flags = MMC_DATA_WRITE;
-		mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
-
-		memset(&cmd, 0, sizeof(cmd));
-		memset(&data, 0, sizeof(data));
-		cmd.opcode = MMC_BUSTEST_R;
-		cmd.arg = 0;
-		cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
-		cmd.data = &data;
-
-		data.data = buf;
-		data.len = 4;
-		data.flags = MMC_DATA_READ;
-		err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, 0);
-		sc->squelched--;
-
-		mmcbr_set_bus_width(sc->dev, bus_width_1);
-		mmcbr_update_ios(sc->dev);
-
-		if (err == MMC_ERR_NONE && memcmp(buf, p4ok, 4) == 0)
-			return (bus_width_4);
-	}
-	return (bus_width_1);
+	/* Return the card to 1-bit mode like the host. */
+	(void)mmc_switch(sc->dev, sc->dev, ivar->rca, EXT_CSD_CMD_SET_NORMAL,
+	    EXT_CSD_BUS_WIDTH, EXT_CSD_BUS_WIDTH_1, ivar->cmd6_time, true);
+	return (width);
 }
 
 static uint32_t
@@ -1799,6 +1753,14 @@ mmc_discover_cards(struct mmc_softc *sc)
 			}
 			ext_csd = ivar->raw_ext_csd;
 			rev = ext_csd[EXT_CSD_REV];
+			/*
+			 * Determine generic switch timeout (provided in
+			 * units of 10 ms), defaulting to 500 ms.
+			 */
+			ivar->cmd6_time = 500 * 1000;
+			if (rev >= 6)
+				ivar->cmd6_time = 10 *
+				    ext_csd[EXT_CSD_GEN_CMD6_TIME];
 			/* Handle extended capacity from EXT_CSD */
 			sec_count = le32dec(&ext_csd[EXT_CSD_SEC_CNT]);
 			if (sec_count != 0) {
@@ -1806,7 +1768,7 @@ mmc_discover_cards(struct mmc_softc *sc)
 				ivar->high_cap = 1;
 			}
 			/* Find maximum supported bus width. */
-			ivar->bus_width = mmc_test_bus_width(sc);
+			ivar->bus_width = mmc_test_bus_width(sc, ivar);
 			/* Get device speeds beyond normal mode. */
 			card_type = ext_csd[EXT_CSD_CARD_TYPE];
 			if ((card_type & EXT_CSD_CARD_TYPE_HS_52) != 0) {
@@ -1864,14 +1826,6 @@ mmc_discover_cards(struct mmc_softc *sc)
 				setbit(&ivar->timings, bus_timing_mmc_hs400es);
 				setbit(&ivar->vccq_180, bus_timing_mmc_hs400es);
 			}
-			/*
-			 * Determine generic switch timeout (provided in
-			 * units of 10 ms), defaulting to 500 ms.
-			 */
-			ivar->cmd6_time = 500 * 1000;
-			if (rev >= 6)
-				ivar->cmd6_time = 10 *
-				    ext_csd[EXT_CSD_GEN_CMD6_TIME];
 			/* Handle HC erase sector size. */
 			if (ext_csd[EXT_CSD_ERASE_GRP_SIZE] != 0) {
 				ivar->erase_sector = 1024 *
