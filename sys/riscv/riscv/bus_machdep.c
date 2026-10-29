@@ -46,46 +46,56 @@ uint16_t generic_bs_r_2(void *, bus_space_handle_t, bus_size_t);
 uint32_t generic_bs_r_4(void *, bus_space_handle_t, bus_size_t);
 uint64_t generic_bs_r_8(void *, bus_space_handle_t, bus_size_t);
 
-void generic_bs_rm_1(void *, bus_space_handle_t, bus_size_t, uint8_t *,
-    bus_size_t);
-void generic_bs_rm_2(void *, bus_space_handle_t, bus_size_t, uint16_t *,
-    bus_size_t);
-void generic_bs_rm_4(void *, bus_space_handle_t, bus_size_t, uint32_t *,
-    bus_size_t);
-void generic_bs_rm_8(void *, bus_space_handle_t, bus_size_t, uint64_t *,
-    bus_size_t);
-
-void generic_bs_rr_1(void *, bus_space_handle_t, bus_size_t, uint8_t *,
-    bus_size_t);
-void generic_bs_rr_2(void *, bus_space_handle_t, bus_size_t, uint16_t *,
-    bus_size_t);
-void generic_bs_rr_4(void *, bus_space_handle_t, bus_size_t, uint32_t *,
-    bus_size_t);
-void generic_bs_rr_8(void *, bus_space_handle_t, bus_size_t, uint64_t *,
-    bus_size_t);
-
 void generic_bs_w_1(void *, bus_space_handle_t, bus_size_t, uint8_t);
 void generic_bs_w_2(void *, bus_space_handle_t, bus_size_t, uint16_t);
 void generic_bs_w_4(void *, bus_space_handle_t, bus_size_t, uint32_t);
 void generic_bs_w_8(void *, bus_space_handle_t, bus_size_t, uint64_t);
 
-void generic_bs_wm_1(void *, bus_space_handle_t, bus_size_t, const uint8_t *,
-    bus_size_t);
-void generic_bs_wm_2(void *, bus_space_handle_t, bus_size_t, const uint16_t *,
-    bus_size_t);
-void generic_bs_wm_4(void *, bus_space_handle_t, bus_size_t, const uint32_t *,
-    bus_size_t);
-void generic_bs_wm_8(void *, bus_space_handle_t, bus_size_t, const uint64_t *,
-    bus_size_t);
+/*
+ * Multiple accesses repeat the same register; region accesses walk through
+ * consecutive registers. Both are built on the single accessors.
+ */
+#define	GENERIC_BS_MULTI(n, type)					\
+static void								\
+generic_bs_rm_##n(void *t, bus_space_handle_t bsh, bus_size_t offset,	\
+    type *buf, bus_size_t count)					\
+{									\
+									\
+	while (count-- > 0)						\
+		*buf++ = generic_bs_r_##n(t, bsh, offset);		\
+}									\
+									\
+static void								\
+generic_bs_rr_##n(void *t, bus_space_handle_t bsh, bus_size_t offset,	\
+    type *buf, bus_size_t count)					\
+{									\
+									\
+	for (; count-- > 0; offset += sizeof(type))			\
+		*buf++ = generic_bs_r_##n(t, bsh, offset);		\
+}									\
+									\
+static void								\
+generic_bs_wm_##n(void *t, bus_space_handle_t bsh, bus_size_t offset,	\
+    const type *buf, bus_size_t count)					\
+{									\
+									\
+	while (count-- > 0)						\
+		generic_bs_w_##n(t, bsh, offset, *buf++);		\
+}									\
+									\
+static void								\
+generic_bs_wr_##n(void *t, bus_space_handle_t bsh, bus_size_t offset,	\
+    const type *buf, bus_size_t count)					\
+{									\
+									\
+	for (; count-- > 0; offset += sizeof(type))			\
+		generic_bs_w_##n(t, bsh, offset, *buf++);		\
+}
 
-void generic_bs_wr_1(void *, bus_space_handle_t, bus_size_t, const uint8_t *,
-    bus_size_t);
-void generic_bs_wr_2(void *, bus_space_handle_t, bus_size_t, const uint16_t *,
-    bus_size_t);
-void generic_bs_wr_4(void *, bus_space_handle_t, bus_size_t, const uint32_t *,
-    bus_size_t);
-void generic_bs_wr_8(void *, bus_space_handle_t, bus_size_t, const uint64_t *,
-    bus_size_t);
+GENERIC_BS_MULTI(1, uint8_t)
+GENERIC_BS_MULTI(2, uint16_t)
+GENERIC_BS_MULTI(4, uint32_t)
+GENERIC_BS_MULTI(8, uint64_t)
 
 static int
 generic_bs_map(void *t, bus_addr_t bpa, bus_size_t size, int flags,
@@ -145,10 +155,16 @@ struct bus_space memmap_bus = {
 	.bs_r_8 = generic_bs_r_8,
 
 	/* read multiple */
-	.bs_rm_1 = NULL,
-	.bs_rm_2 = NULL,
-	.bs_rm_4 = NULL,
-	.bs_rm_8 = NULL,
+	.bs_rm_1 = generic_bs_rm_1,
+	.bs_rm_2 = generic_bs_rm_2,
+	.bs_rm_4 = generic_bs_rm_4,
+	.bs_rm_8 = generic_bs_rm_8,
+
+	/* read region */
+	.bs_rr_1 = generic_bs_rr_1,
+	.bs_rr_2 = generic_bs_rr_2,
+	.bs_rr_4 = generic_bs_rr_4,
+	.bs_rr_8 = generic_bs_rr_8,
 
 	/* write single */
 	.bs_w_1 = generic_bs_w_1,
@@ -157,16 +173,16 @@ struct bus_space memmap_bus = {
 	.bs_w_8 = generic_bs_w_8,
 
 	/* write multiple */
-	.bs_wm_1 = NULL,
-	.bs_wm_2 = NULL,
-	.bs_wm_4 = NULL,
-	.bs_wm_8 = NULL,
+	.bs_wm_1 = generic_bs_wm_1,
+	.bs_wm_2 = generic_bs_wm_2,
+	.bs_wm_4 = generic_bs_wm_4,
+	.bs_wm_8 = generic_bs_wm_8,
 
 	/* write region */
-	.bs_wr_1 = NULL,
-	.bs_wr_2 = NULL,
-	.bs_wr_4 = NULL,
-	.bs_wr_8 = NULL,
+	.bs_wr_1 = generic_bs_wr_1,
+	.bs_wr_2 = generic_bs_wr_2,
+	.bs_wr_4 = generic_bs_wr_4,
+	.bs_wr_8 = generic_bs_wr_8,
 
 	/* set multiple */
 	.bs_sm_1 = NULL,
