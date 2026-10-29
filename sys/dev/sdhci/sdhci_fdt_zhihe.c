@@ -28,7 +28,7 @@
 /*
  * Synopsys DesignWare Mobile Storage Host Controller with the PHY used by
  * the T-Head TH1520 and the Zhihe A210. HS200 and HS400 need tuning, which
- * is not implemented, so the controller runs at up to High Speed (52 MHz).
+ * is not implemented; eMMC with enhanced strobe runs in HS400ES.
  */
 
 #include <sys/param.h>
@@ -63,6 +63,8 @@
 #define	 DWCMSHC_AREA1_MASK		0xfff
 #define	DWCMSHC_EMMC_CONTROL		0x2c	/* In vendor area 1 */
 #define	 DWCMSHC_CARD_IS_EMMC		(1 << 0)
+#define	 DWCMSHC_ENHANCED_STROBE	(1 << 8)
+#define	DWCMSHC_CTRL_HS400		0x7	/* Host control 2 UHS mode */
 
 #define	PHY_CNFG			0x300
 #define	 PHY_CNFG_RSTN_DEASSERT		(1 << 0)
@@ -83,6 +85,7 @@
 #define	 PHY_SDCLKDL_CNFG_UPDATE	(1 << 4)
 #define	PHY_SDCLKDL_DC			0x31e
 #define	 PHY_SDCLKDL_DC_DEFAULT		0x32
+#define	 PHY_SDCLKDL_DC_HS400		0x18
 #define	PHY_DLL_CTRL			0x324
 #define	 PHY_DLL_CTRL_ENABLE		0x1
 #define	PHY_DLL_CNFG1			0x325
@@ -103,6 +106,7 @@ struct sdhci_zhihe_softc {
 	bus_size_t		area1;		/* Vendor specific area 1 */
 	bool			fixed_1v8;	/* I/O is wired to 1.8 V */
 	bool			emmc;
+	bool			hs400;		/* HS400 delay line selected */
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -131,7 +135,8 @@ sdhci_zhihe_phy_init(struct sdhci_zhihe_softc *sc)
 
 	/* Program the SD clock delay line while it is held for update. */
 	WR1(sc, PHY_SDCLKDL_CNFG, PHY_SDCLKDL_CNFG_UPDATE);
-	WR1(sc, PHY_SDCLKDL_DC, PHY_SDCLKDL_DC_DEFAULT);
+	WR1(sc, PHY_SDCLKDL_DC, sc->hs400 ? PHY_SDCLKDL_DC_HS400 :
+	    PHY_SDCLKDL_DC_DEFAULT);
 	WR1(sc, PHY_DLL_CNFG2, PHY_DLL_CNFG2_JUMPSTEP);
 	WR1(sc, PHY_SDCLKDL_CNFG,
 	    RD1(sc, PHY_SDCLKDL_CNFG) & ~PHY_SDCLKDL_CNFG_UPDATE);
@@ -197,10 +202,51 @@ static void
 sdhci_zhihe_set_uhs_timing(device_t dev, struct sdhci_slot *slot)
 {
 	struct sdhci_zhihe_softc *sc;
+	const struct mmc_ios *ios;
+	uint16_t ctrl, hostctrl2;
+	bool hs400;
 
 	sc = device_get_softc(dev);
+	ios = &slot->host.ios;
+	hs400 = ios->timing == bus_timing_mmc_hs400 ||
+	    ios->timing == bus_timing_mmc_hs400es;
+
 	sdhci_generic_set_uhs_timing(dev, slot);
+
+	if (sc->area1 == 0)
+		sc->area1 = RD4(sc, DWCMSHC_P_VENDOR_AREA1) &
+		    DWCMSHC_AREA1_MASK;
+	ctrl = RD2(sc, sc->area1 + DWCMSHC_EMMC_CONTROL);
+	if (ios->timing == bus_timing_mmc_hs400es)
+		ctrl |= DWCMSHC_ENHANCED_STROBE;
+	else
+		ctrl &= ~DWCMSHC_ENHANCED_STROBE;
+	WR2(sc, sc->area1 + DWCMSHC_EMMC_CONTROL, ctrl);
+
+	/* The controller uses its own encoding for HS400. */
+	if (hs400 && ios->clock > SD_SDR50_MAX) {
+		hostctrl2 = RD2(sc, SDHCI_HOST_CONTROL2);
+		hostctrl2 &= ~SDHCI_CTRL2_UHS_MASK;
+		hostctrl2 |= DWCMSHC_CTRL_HS400;
+		WR2(sc, SDHCI_HOST_CONTROL2, hostctrl2);
+	}
+
+	sc->hs400 = hs400;
 	sdhci_zhihe_phy_init(sc);
+}
+
+static int
+sdhci_zhihe_switch_vccq(device_t brdev, device_t reqdev)
+{
+	struct sdhci_zhihe_softc *sc;
+	struct sdhci_slot *slot;
+
+	sc = device_get_softc(brdev);
+	slot = device_get_ivars(reqdev);
+	/* The I/O rail is wired to 1.8 V: only 1.8 V signaling works. */
+	if (sc->fixed_1v8)
+		return (slot->host.ios.vccq == vccq_180 ? 0 : EINVAL);
+	return (sdhci_generic_switch_vccq(brdev, reqdev));
 }
 
 static int
@@ -260,7 +306,24 @@ sdhci_zhihe_attach(device_t dev)
 	}
 	sc->base_mhz = MIN(freq / 1000000, 255);
 
-	return (sdhci_fdt_attach(dev));
+	error = sdhci_fdt_attach(dev);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * HS400 with enhanced strobe samples data with the strobe from the
+	 * card and needs no tuning.  HS200 and plain HS400 need tuning,
+	 * which is not implemented.
+	 */
+	if (sc->fixed_1v8 && OF_hasprop(node, "mmc-hs400-1_8v") &&
+	    OF_hasprop(node, "mmc-hs400-enhanced-strobe") &&
+	    OF_hasprop(node, "non-removable")) {
+		for (int i = 0; i < sc->base.num_slots; i++)
+			sc->base.slots[i].host.caps |= MMC_CAP_MMC_HS400_180 |
+			    MMC_CAP_MMC_ENH_STROBE | MMC_CAP_SIGNALING_180;
+	}
+
+	return (0);
 }
 
 static device_method_t sdhci_zhihe_methods[] = {
@@ -272,6 +335,9 @@ static device_method_t sdhci_zhihe_methods[] = {
 	DEVMETHOD(sdhci_read_4,		sdhci_zhihe_read_4),
 	DEVMETHOD(sdhci_reset,		sdhci_zhihe_reset),
 	DEVMETHOD(sdhci_set_uhs_timing,	sdhci_zhihe_set_uhs_timing),
+
+	/* mmcbr_if */
+	DEVMETHOD(mmcbr_switch_vccq,	sdhci_zhihe_switch_vccq),
 
 	DEVMETHOD_END
 };
