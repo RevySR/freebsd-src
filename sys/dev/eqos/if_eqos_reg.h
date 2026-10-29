@@ -299,10 +299,12 @@
 
 #define	EQOS_RDES3_OWN				(1U << 31)
 #define	EQOS_RDES3_IOC				(1U << 30)
+#define	EQOS_RDES3_LD				(1U << 28)
 #define	EQOS_RDES3_BUF1V			(1U << 24)
 #define	EQOS_RDES3_GP				(1U << 23)
 #define	EQOS_RDES3_OE				(1U << 21)
 #define	EQOS_RDES3_RE				(1U << 20)
+#define	EQOS_RDES3_ES				(1U << 15)
 #define	EQOS_RDES3_LENGTH_MASK			0x7FFFU
 
 #endif

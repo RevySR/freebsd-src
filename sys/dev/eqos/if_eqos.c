@@ -730,6 +730,7 @@ eqos_rxintr(struct eqos_softc *sc)
 	if_t ifp = sc->ifp;
 	struct mbuf *m;
 	uint32_t rdes3;
+	bool error_status;
 	int error, length;
 
 	while (true) {
@@ -737,16 +738,11 @@ eqos_rxintr(struct eqos_softc *sc)
 		if ((rdes3 & EQOS_RDES3_OWN))
 			break;
 
-		if (rdes3 & EQOS_RDES3_RE) {
-			printf("Receive error rdes3=%08x\n", rdes3);
+		/* The error summary and its individual bits are valid on LD. */
+		error_status = (rdes3 & (EQOS_RDES3_ES | EQOS_RDES3_LD)) ==
+		    (EQOS_RDES3_ES | EQOS_RDES3_LD);
+		if (error_status)
 			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
-		}
-		if (rdes3 & EQOS_RDES3_OE) {
-			if (rdes3 & EQOS_RDES3_LENGTH_MASK) {
-				printf("Receive overflow error rdes3=%08x\n", rdes3);
-			}
-			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
-		}
 
 		bus_dmamap_sync(sc->rx.buf_tag,
 		    sc->rx.buf_map[sc->rx.head].map, BUS_DMASYNC_POSTREAD);
@@ -754,7 +750,7 @@ eqos_rxintr(struct eqos_softc *sc)
 		    sc->rx.buf_map[sc->rx.head].map);
 
 		length = rdes3 & EQOS_RDES3_LENGTH_MASK;
-		if (length) {
+		if (length && !error_status) {
 			m = sc->rx.buf_map[sc->rx.head].mbuf;
 			m->m_pkthdr.rcvif = ifp;
 			m->m_pkthdr.len = length;
@@ -775,7 +771,8 @@ eqos_rxintr(struct eqos_softc *sc)
 		} else
 			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 
-		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+		if (length && !error_status)
+			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
 
 		WR4(sc, GMAC_DMA_CHAN0_RX_END_ADDR,
 		    (uint32_t)sc->rx.desc_ring_paddr + DESC_OFFSET(sc->rx.head));
