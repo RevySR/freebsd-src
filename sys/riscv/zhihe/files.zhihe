@@ -6,3 +6,4 @@ riscv/zhihe/a210_usb2phy.c		optional	fdt phy
 dev/ichiic/ig4_fdt.c			optional	ig4 iicbus fdt
 riscv/zhihe/a210_c10phy.c		optional	fdt phy
 riscv/zhihe/a210_typec.c		optional	fdt iicbus regulator
+riscv/zhihe/a210_e16phy.c		optional	fdt phy
