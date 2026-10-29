@@ -271,6 +271,101 @@ dwc_otg_read_fifo(struct dwc_otg_softc *sc, struct usb_page_cache *pc,
 }
 
 static void
+dwc_otg_host_dma_start(struct dwc_otg_softc *sc, struct dwc_otg_td *td,
+    uint8_t channel, uint32_t offset, uint32_t count, uint32_t limit,
+    uint8_t is_out)
+{
+	struct usb_page_cache *pc;
+	struct usb_page_search buf_res;
+
+	pc = td->pc;
+	usbd_get_page(pc, offset, &buf_res);
+
+	/*
+	 * Buffer DMA needs a word-aligned, physically contiguous packet
+	 * that fits in the transfer buffer.  Use the channel bounce
+	 * buffer otherwise.
+	 */
+	if (count == 0 || limit < count || (buf_res.physaddr & 3) != 0 ||
+	    buf_res.length < count) {
+		KASSERT(count <= DWC_OTG_DMA_BOUNCE_SIZE,
+		    ("DMA packet too large: %u", count));
+		pc = &sc->sc_dma_pc[channel];
+		if (count != 0 && is_out) {
+			usbd_copy_out(td->pc, offset, pc->buffer, count);
+			usb_pc_cpu_flush(pc);
+		} else if (!is_out) {
+			usb_pc_cpu_invalidate(pc);
+		}
+		usbd_get_page(pc, 0, &buf_res);
+	}
+	DWC_OTG_WRITE_4(sc, DOTG_HCDMA(channel), buf_res.physaddr);
+}
+
+/*
+ * With buffer DMA the core retries NAKed non-periodic transactions by
+ * itself and the status bits are final only once the channel has halted.
+ * Report a completed transfer as an ACK, as the FIFO mode code expects.
+ */
+static uint32_t
+dwc_otg_host_dma_hcint(struct dwc_otg_softc *sc, uint8_t x, uint32_t hcint)
+{
+	if ((hcint & HCINT_CHHLTD) == 0)
+		return (0);
+
+	sc->sc_chan_state[x].wait_halted = 0;
+	if (hcint & HCINT_AHBERR)
+		hcint |= HCINT_XACTERR;
+	/*
+	 * The core occasionally halts a completed transfer with ACK but
+	 * without XFERCOMPL.  All packets are done once PKTCNT is zero.
+	 */
+	if ((hcint & (HCINT_ACK | HCINT_XFERCOMPL | HCINT_STALL |
+	    HCINT_ERRORS)) == HCINT_ACK &&
+	    (DWC_OTG_READ_4(sc, DOTG_HCTSIZ(x)) & HCTSIZ_PKTCNT_MASK) == 0)
+		hcint |= HCINT_XFERCOMPL;
+	if (hcint & HCINT_XFERCOMPL) {
+		hcint &= ~(HCINT_RETRY | HCINT_ERRORS);
+		hcint |= HCINT_ACK;
+	} else if ((hcint & (HCINT_STALL | HCINT_ERRORS | HCINT_NYET |
+	    HCINT_NAK)) == 0 &&
+	    (DWC_OTG_READ_4(sc, DOTG_HCSPLT(x)) &
+	    (HCSPLT_SPLTENA | HCSPLT_COMPSPLT)) != HCSPLT_SPLTENA) {
+		/*
+		 * Only a start split halts on a plain ACK.  Retry any
+		 * other transfer that halted without completing.
+		 */
+		hcint &= ~HCINT_ACK;
+		hcint |= HCINT_XACTERR;
+	}
+	return (hcint);
+}
+
+/*
+ * With buffer DMA the core retries NAKed start splits by itself, so a
+ * control or bulk complete split may be issued later than the service
+ * interval the FIFO mode schedule assumes.  The TT keeps the result of
+ * an asynchronous transaction until it is fetched.
+ */
+static bool
+dwc_otg_host_dma_async_split(struct dwc_otg_softc *sc, struct dwc_otg_td *td)
+{
+	return (sc->sc_host_dma &&
+	    (td->ep_type == UE_CONTROL || td->ep_type == UE_BULK));
+}
+
+static void
+dwc_otg_free_dma_bounce(struct dwc_otg_softc *sc)
+{
+	uint8_t x;
+
+	for (x = 0; x != DWC_OTG_MAX_CHANNELS; x++) {
+		if (sc->sc_dma_pc[x].buffer != NULL)
+			usb_pc_free_mem(&sc->sc_dma_pc[x]);
+	}
+}
+
+static void
 dwc_otg_tx_fifo_reset(struct dwc_otg_softc *sc, uint32_t value)
 {
 	uint32_t temp;
@@ -348,12 +443,29 @@ dwc_otg_init_fifo(struct dwc_otg_softc *sc, uint8_t mode)
 		for (x = 0; x != sc->sc_host_ch_max; x++) {
 			/* enable all host interrupts */
 			DWC_OTG_WRITE_4(sc, DOTG_HCINTMSK(x),
+			    sc->sc_host_dma ? HCINT_CHHLTD :
 			    HCINT_DEFAULT_MASK);
 		}
 
 		DWC_OTG_WRITE_4(sc, DOTG_HPTXFSIZ,
 		    ((fifo_size / 4) << 16) |
 		    (tx_start / 4));
+
+		if (sc->sc_host_dma) {
+			/*
+			 * Use the FIFO layout the core resets to, as Linux
+			 * does.  With buffer DMA the transmit FIFOs fill
+			 * from memory as fast as the bus drains them, and
+			 * the layout above overruns them on the A210: bulk
+			 * OUT transfers of several packets made a downstream
+			 * hub drop off the bus.
+			 */
+			DWC_OTG_WRITE_4(sc, DOTG_GRXFSIZ, sc->sc_fifo_reset[0]);
+			DWC_OTG_WRITE_4(sc, DOTG_GNPTXFSIZ,
+			    sc->sc_fifo_reset[1]);
+			DWC_OTG_WRITE_4(sc, DOTG_HPTXFSIZ,
+			    sc->sc_fifo_reset[2]);
+		}
 
 		/* reset host channel state */
 		memset(sc->sc_chan_state, 0, sizeof(sc->sc_chan_state));
@@ -683,8 +795,10 @@ dwc_otg_common_rx_ack(struct dwc_otg_softc *sc)
 	DPRINTFN(5, "RX status clear\n");
 
 	/* enable RX FIFO level interrupt */
-	sc->sc_irq_mask |= GINTMSK_RXFLVLMSK;
-	DWC_OTG_WRITE_4(sc, DOTG_GINTMSK, sc->sc_irq_mask);
+	if (!sc->sc_host_dma || sc->sc_flags.status_device_mode != 0) {
+		sc->sc_irq_mask |= GINTMSK_RXFLVLMSK;
+		DWC_OTG_WRITE_4(sc, DOTG_GINTMSK, sc->sc_irq_mask);
+	}
 
 	if (sc->sc_current_rx_bytes != 0) {
 		/* need to dump remaining data */
@@ -760,8 +874,8 @@ dwc_otg_host_channel_alloc(struct dwc_otg_softc *sc,
 	if (DWC_OTG_PC2UDEV(td->pc)->flags.self_suspended != 0)
 		return (1);		/* busy - cannot transfer data */
 
-	/* compute needed TX FIFO size */
-	if (is_out != 0) {
+	/* Buffer DMA does not use the transmit FIFOs. */
+	if (is_out != 0 && !sc->sc_host_dma) {
 		if (dwc_otg_host_check_tx_fifo_empty(sc, td) != 0)
 			return (1);	/* busy - cannot transfer data */
 	}
@@ -1028,12 +1142,20 @@ send_pkt:
 	hcchar &= ~(HCCHAR_EPDIR_IN | HCCHAR_EPTYPE_MASK);
 	hcchar |= UE_CONTROL << HCCHAR_EPTYPE_SHIFT;
 
+	if (sc->sc_host_dma) {
+		dwc_otg_host_dma_start(sc, td, td->channel[0], 0,
+		    sizeof(req), sizeof(req), 1);
+	}
+
 	/* must enable channel before writing data to FIFO */
 	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(td->channel[0]), hcchar);
 
-	/* transfer data into FIFO */
-	bus_space_write_region_4(sc->sc_io_tag, sc->sc_io_hdl,
-	    DOTG_DFIFO(td->channel[0]), (uint32_t *)&req, sizeof(req) / 4);
+	if (!sc->sc_host_dma) {
+		/* transfer data into FIFO */
+		bus_space_write_region_4(sc->sc_io_tag, sc->sc_io_hdl,
+		    DOTG_DFIFO(td->channel[0]), (uint32_t *)&req,
+		    sizeof(req) / 4);
+	}
 
 	/* wait until next slot before trying complete split */
 	td->tt_complete_slot = sc->sc_last_frame_num + 1;
@@ -1052,7 +1174,8 @@ send_cpkt:
 		goto busy;
 	}
 	delta = sc->sc_last_frame_num - td->tt_start_slot;
-	if (delta > DWC_OTG_TT_SLOT_MAX) {
+	if (delta > DWC_OTG_TT_SLOT_MAX &&
+	    !dwc_otg_host_dma_async_split(sc, td)) {
 		/* we missed the service interval */
 		if (td->ep_type != UE_ISOCHRONOUS)
 			td->error_any = 1;
@@ -1071,6 +1194,7 @@ send_cpkt:
 	td->state = DWC_CHAN_ST_WAIT_C_ANE;
 
 	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(td->channel[0]),
+	    ((sc->sc_host_dma ? 1 : 0) << HCTSIZ_PKTCNT_SHIFT) |
 	    (HCTSIZ_PID_SETUP << HCTSIZ_PID_SHIFT));
 
 	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(td->channel[0]), td->hcsplt);
@@ -1078,6 +1202,9 @@ send_cpkt:
 	hcchar = td->hcchar;
 	hcchar &= ~(HCCHAR_EPDIR_IN | HCCHAR_EPTYPE_MASK);
 	hcchar |= UE_CONTROL << HCCHAR_EPTYPE_SHIFT;
+
+	if (sc->sc_host_dma)
+		dwc_otg_host_dma_start(sc, td, td->channel[0], 0, 0, 0, 1);
 
 	/* must enable channel before writing data to FIFO */
 	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(td->channel[0]), hcchar);
@@ -1253,7 +1380,91 @@ static uint8_t
 dwc_otg_host_data_rx_sub(struct dwc_otg_softc *sc, struct dwc_otg_td *td,
     uint8_t channel)
 {
+	struct usb_page_cache *pc;
 	uint32_t count;
+	uint32_t hcint;
+	uint32_t hctsiz;
+
+	if (sc->sc_host_dma) {
+		if (channel >= DWC_OTG_MAX_CHANNELS)
+			return (0);
+		hcint = sc->sc_chan_state[channel].hcint;
+		hctsiz = DWC_OTG_READ_4(sc, DOTG_HCTSIZ(channel));
+
+		if (td->tx_bytes > td->max_packet_size &&
+		    (hcint & (HCINT_CHHLTD | HCINT_XFERCOMPL |
+		    HCINT_SOFTWARE_ONLY)) == HCINT_CHHLTD) {
+			/*
+			 * A multi-packet transfer halted early.  Keep the
+			 * packets received so far and continue from there.
+			 */
+			count = td->tx_bytes - (hctsiz & HCTSIZ_XFERSIZE_MASK);
+			if (count > td->remainder) {
+				td->error_any = 1;
+				return (1);
+			}
+			if (count != 0) {
+				pc = &sc->sc_dma_pc[channel];
+				usb_pc_cpu_invalidate(pc);
+				usbd_copy_in(td->pc, td->offset, pc->buffer,
+				    count);
+				td->remainder -= count;
+				td->offset += count;
+				td->toggle = ((hctsiz & HCTSIZ_PID_MASK) >>
+				    HCTSIZ_PID_SHIFT) == HCTSIZ_PID_DATA1;
+			}
+			sc->sc_chan_state[channel].hcint |=
+			    HCINT_SOFTWARE_ONLY;
+			return (0);
+		}
+
+		/* A start split is ACKed without completing the transfer. */
+		if ((hcint & (HCINT_XFERCOMPL | HCINT_SOFTWARE_ONLY)) !=
+		    HCINT_XFERCOMPL)
+			return (0);
+
+		count = td->tx_bytes - (hctsiz & HCTSIZ_XFERSIZE_MASK);
+		if (count > td->tx_bytes || count > td->remainder) {
+			td->error_any = 1;
+			return (1);
+		}
+		if (td->ep_type == UE_ISOCHRONOUS) {
+			td->tt_xactpos = HCSPLT_XACTPOS_BEGIN;
+			if (count != td->remainder) {
+				td->short_pkt = 1;
+				td->got_short = 1;
+			}
+		} else {
+			if (count < td->tx_bytes) {
+				td->short_pkt = 1;
+				td->got_short = 1;
+			}
+			if (td->tx_bytes > td->max_packet_size) {
+				td->toggle = ((hctsiz & HCTSIZ_PID_MASK) >>
+				    HCTSIZ_PID_SHIFT) == HCTSIZ_PID_DATA1;
+			} else {
+				td->toggle ^= 1;
+			}
+			td->tt_scheduled = 0;
+		}
+
+		if (count != 0) {
+			pc = &sc->sc_dma_pc[channel];
+			usb_pc_cpu_invalidate(pc);
+			usbd_copy_in(td->pc, td->offset, pc->buffer, count);
+		}
+		td->remainder -= count;
+		td->offset += count;
+		/*
+		 * Write the received data back once the TD is done, so that
+		 * the POSTREAD sync at transfer completion keeps it.
+		 */
+		if (td->remainder == 0 || td->got_short ||
+		    td->ep_type == UE_ISOCHRONOUS)
+			usb_pc_cpu_flush(td->pc);
+		sc->sc_chan_state[channel].hcint |= HCINT_SOFTWARE_ONLY;
+		return (0);
+	}
 
 	/* check endpoint status */
 	if (sc->sc_last_rx_status == 0)
@@ -1352,6 +1563,7 @@ dwc_otg_host_data_rx(struct dwc_otg_softc *sc, struct dwc_otg_td *td)
 {
 	uint32_t hcint = 0;
 	uint32_t hcchar;
+	uint32_t npkt;
 	uint8_t delta;
 	uint8_t channel;
 	uint8_t x;
@@ -1531,7 +1743,8 @@ receive_pkt:
 			}
 		}
 		delta = sc->sc_last_frame_num - td->tt_start_slot;
-		if (delta > DWC_OTG_TT_SLOT_MAX) {
+		if (delta > DWC_OTG_TT_SLOT_MAX &&
+		    !dwc_otg_host_dma_async_split(sc, td)) {
 			if (td->ep_type != UE_ISOCHRONOUS) {
 				/* we missed the service interval */
 				td->error_any = 1;
@@ -1559,13 +1772,27 @@ receive_pkt:
 
 	td->state = DWC_CHAN_ST_WAIT_ANE;
 
+	/*
+	 * With buffer DMA a non-split bulk IN channel can receive several
+	 * packets before it halts.  Other transfers use one packet.
+	 */
+	npkt = 1;
+	if (sc->sc_host_dma && td->ep_type == UE_BULK && td->hcsplt == 0 &&
+	    td->max_packet_count == 1) {
+		npkt = howmany(MIN(td->remainder, DWC_OTG_DMA_BOUNCE_SIZE),
+		    td->max_packet_size);
+		if (npkt == 0)
+			npkt = 1;
+	}
+	td->tx_bytes = npkt * td->max_packet_size;
+
 	for (x = 0; x != td->max_packet_count; x++) {
 	  	channel = td->channel[x];
 
-		/* receive one packet */
+		/* receive one or more packets */
 		DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
-		    (td->max_packet_size << HCTSIZ_XFERSIZE_SHIFT) |
-		    (1 << HCTSIZ_PKTCNT_SHIFT) |
+		    (td->tx_bytes << HCTSIZ_XFERSIZE_SHIFT) |
+		    (npkt << HCTSIZ_PKTCNT_SHIFT) |
 		    (td->toggle ? (HCTSIZ_PID_DATA1 << HCTSIZ_PID_SHIFT) :
 		    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT)));
 
@@ -1590,6 +1817,16 @@ receive_pkt:
 			}
 		} else {
 			hcchar &= ~HCCHAR_ODDFRM;
+		}
+
+		if (sc->sc_host_dma) {
+			/*
+			 * IN packets always go through the channel bounce
+			 * buffer: data written by the CPU and by the
+			 * controller must not be mixed in one busdma map.
+			 */
+			dwc_otg_host_dma_start(sc, td, channel, td->offset,
+			    td->tx_bytes, 0, 0);
 		}
 
 		/* must enable channel before data can be received */
@@ -1630,6 +1867,7 @@ receive_spkt:
 
 	/* receive one packet */
 	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
+	    ((sc->sc_host_dma ? 1 : 0) << HCTSIZ_PKTCNT_SHIFT) |
 	    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT));
 
 	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(channel), td->hcsplt);
@@ -1646,6 +1884,9 @@ receive_spkt:
 
 	/* wait until next slot before trying complete split */
 	td->tt_complete_slot = sc->sc_last_frame_num + 1;
+
+	if (sc->sc_host_dma)
+		dwc_otg_host_dma_start(sc, td, channel, td->offset, 0, 0, 0);
 
 	/* must enable channel before data can be received */
 	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel), hcchar);
@@ -1839,6 +2080,39 @@ dwc_otg_host_data_tx(struct dwc_otg_softc *sc, struct dwc_otg_td *td)
 		goto send_pkt;
 
 	case DWC_CHAN_ST_WAIT_ANE:
+		if (td->tx_bytes > td->max_packet_size &&
+		    (hcint & (HCINT_ACK | HCINT_RETRY | HCINT_ERRORS |
+		    HCINT_NYET)) != 0) {
+			/*
+			 * A multi-packet buffer DMA transfer: account for
+			 * the packets the device accepted and continue
+			 * with the data toggle the core expects next.
+			 */
+			uint32_t hctsiz;
+
+			hctsiz = DWC_OTG_READ_4(sc, DOTG_HCTSIZ(channel));
+			if (hcint & HCINT_XFERCOMPL) {
+				count = td->tx_bytes;
+			} else {
+				count = howmany(td->tx_bytes,
+				    td->max_packet_size) -
+				    ((hctsiz & HCTSIZ_PKTCNT_MASK) >>
+				    HCTSIZ_PKTCNT_SHIFT);
+				count = MIN(count * td->max_packet_size,
+				    td->tx_bytes);
+			}
+			td->offset += count;
+			td->remainder -= count;
+			td->toggle = ((hctsiz & HCTSIZ_PID_MASK) >>
+			    HCTSIZ_PID_SHIFT) == HCTSIZ_PID_DATA1;
+			td->did_nak = (hcint & (HCINT_XFERCOMPL |
+			    HCINT_NYET)) != HCINT_XFERCOMPL;
+			td->tx_bytes = 0;
+			if ((hcint & HCINT_XFERCOMPL) && td->remainder == 0 &&
+			    td->short_pkt)
+				goto complete;
+			goto send_pkt;
+		}
 		if (hcint & (HCINT_RETRY | HCINT_ERRORS)) {
 			td->did_nak = 1;
 			td->tt_scheduled = 0;
@@ -1981,6 +2255,33 @@ send_pkt:
 
 	td->tx_bytes = 0;
 
+	if (sc->sc_host_dma && td->ep_type == UE_BULK && td->hcsplt == 0 &&
+	    td->max_packet_count == 1 &&
+	    td->remainder > td->max_packet_size) {
+		/* Let the core send several packets from one buffer. */
+		uint32_t npkt;
+
+		channel = td->channel[0];
+		count = MIN(td->remainder, DWC_OTG_DMA_BOUNCE_SIZE);
+		npkt = howmany(count, td->max_packet_size);
+		if (count < td->max_packet_size * npkt)
+			td->short_pkt = 1;
+
+		DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
+		    (count << HCTSIZ_XFERSIZE_SHIFT) |
+		    (npkt << HCTSIZ_PKTCNT_SHIFT) |
+		    (td->toggle ? (HCTSIZ_PID_DATA1 << HCTSIZ_PID_SHIFT) :
+		    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT)));
+		DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(channel), 0);
+		dwc_otg_host_dma_start(sc, td, channel, td->offset, count,
+		    count, 1);
+		DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel),
+		    td->hcchar & ~(HCCHAR_EPDIR_IN | HCCHAR_ODDFRM));
+		td->tx_bytes = count;
+		td->npkt = 0;
+		goto busy;
+	}
+
 	for (x = 0; x != td->max_packet_count; x++) {
 		uint32_t rem_bytes;
 
@@ -2046,10 +2347,15 @@ send_pkt:
 		else
 			hcchar &= ~HCCHAR_ODDFRM;
 
+		if (sc->sc_host_dma) {
+			dwc_otg_host_dma_start(sc, td, channel,
+			    td->offset + td->tx_bytes, count, count, 1);
+		}
+
 		/* must enable before writing data to FIFO */
 		DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel), hcchar);
 
-		if (count != 0) {
+		if (count != 0 && !sc->sc_host_dma) {
 			/* write data into FIFO */
 			dwc_otg_write_fifo(sc, td->pc, td->offset +
 			    td->tx_bytes, DOTG_DFIFO(channel), count);
@@ -2077,7 +2383,8 @@ send_cpkt:
 		goto busy;
 	}
 	delta = sc->sc_last_frame_num - td->tt_start_slot;
-	if (delta > DWC_OTG_TT_SLOT_MAX) {
+	if (delta > DWC_OTG_TT_SLOT_MAX &&
+	    !dwc_otg_host_dma_async_split(sc, td)) {
 		/* we missed the service interval */
 		if (td->ep_type != UE_ISOCHRONOUS)
 			td->error_any = 1;
@@ -2096,6 +2403,7 @@ send_cpkt:
 	td->state = DWC_CHAN_ST_WAIT_C_ANE;
 
 	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
+	    ((sc->sc_host_dma ? 1 : 0) << HCTSIZ_PKTCNT_SHIFT) |
 	    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT));
 
 	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(channel), td->hcsplt);
@@ -2705,13 +3013,24 @@ repeat:
 		if (x >= sc->sc_host_ch_max)
 			break;
 		temp = DWC_OTG_READ_4(sc, DOTG_HCINT(x));
+		haint &= ~(1U << x);
+		/*
+		 * In buffer DMA mode the status is complete only once the
+		 * channel has halted, so leave earlier bits pending.
+		 */
+		if (sc->sc_host_dma && (temp & HCINT_CHHLTD) == 0)
+			continue;
 		DWC_OTG_WRITE_4(sc, DOTG_HCINT(x), temp);
 		temp &= ~HCINT_SOFTWARE_ONLY;
+		if (sc->sc_host_dma)
+			temp = dwc_otg_host_dma_hcint(sc, x, temp);
 		sc->sc_chan_state[x].hcint |= temp;
-		haint &= ~(1U << x);
 	}
 
-	if (sc->sc_last_rx_status == 0) {
+	if (sc->sc_host_dma && sc->sc_flags.status_device_mode == 0) {
+		/* In buffer DMA mode the core drains the receive FIFO. */
+		got_rx_status = 0;
+	} else if (sc->sc_last_rx_status == 0) {
 		temp = DWC_OTG_READ_4(sc, DOTG_GINTSTS);
 		if (temp & GINTSTS_RXFLVL) {
 			/* pop current status */
@@ -3858,6 +4177,18 @@ dwc_otg_init(struct dwc_otg_softc *sc)
 		return (ENOMEM);
 	}
 
+	/* Device mode still uses the FIFOs, so only a host uses DMA. */
+	if (sc->sc_mode != DWC_MODE_HOST)
+		sc->sc_host_dma = 0;
+	for (x = 0; sc->sc_host_dma && x != DWC_OTG_MAX_CHANNELS; x++) {
+		sc->sc_dma_pc[x].tag_parent = sc->sc_bus.dma_parent_tag;
+		if (usb_pc_alloc_mem(&sc->sc_dma_pc[x], &sc->sc_dma_pg[x],
+		    DWC_OTG_DMA_BOUNCE_SIZE, DWC_OTG_DMA_BOUNCE_SIZE)) {
+			dwc_otg_free_dma_bounce(sc);
+			return (ENOMEM);
+		}
+	}
+
 	sc->sc_bus.bdev = device_add_child(sc->sc_bus.parent, "usbus", DEVICE_UNIT_ANY);
 	if (sc->sc_bus.bdev == NULL)
 		return (ENXIO);
@@ -4009,6 +4340,11 @@ dwc_otg_init(struct dwc_otg_softc *sc)
 
 	sc->sc_fifo_size = 4 * GHWCFG3_DFIFODEPTH_GET(temp);
 
+	/* Keep the reset FIFO layout for host buffer DMA. */
+	sc->sc_fifo_reset[0] = DWC_OTG_READ_4(sc, DOTG_GRXFSIZ);
+	sc->sc_fifo_reset[1] = DWC_OTG_READ_4(sc, DOTG_GNPTXFSIZ);
+	sc->sc_fifo_reset[2] = DWC_OTG_READ_4(sc, DOTG_HPTXFSIZ);
+
 	temp = DWC_OTG_READ_4(sc, DOTG_GHWCFG2);
 
 	sc->sc_dev_ep_max = GHWCFG2_NUMDEVEPS_GET(temp);
@@ -4067,9 +4403,12 @@ dwc_otg_init(struct dwc_otg_softc *sc)
 		DWC_OTG_WRITE_4(sc, DOTG_HCFG, temp);
 	}
 
-	/* only enable global IRQ */
-	DWC_OTG_WRITE_4(sc, DOTG_GAHBCFG,
-	    GAHBCFG_GLBLINTRMSK);
+	/* enable global IRQ and, if selected, host buffer DMA */
+	temp = GAHBCFG_GLBLINTRMSK;
+	if (sc->sc_host_dma)
+		temp |= GAHBCFG_DMAEN | (GAHBCFG_HBSTLEN_INCR4 <<
+		    GAHBCFG_HBSTLEN_SHIFT);
+	DWC_OTG_WRITE_4(sc, DOTG_GAHBCFG, temp);
 
 	/* turn off clocks */
 	dwc_otg_clocks_off(sc);
@@ -4121,6 +4460,8 @@ dwc_otg_uninit(struct dwc_otg_softc *sc)
 	USB_BUS_UNLOCK(&sc->sc_bus);
 
 	usb_callout_drain(&sc->sc_timer);
+
+	dwc_otg_free_dma_bounce(sc);
 }
 
 static void
@@ -4810,6 +5151,11 @@ dwc_otg_xfer_setup(struct usb_setup_params *parm)
 	parm->hc_max_packet_size = 0x500;
 	parm->hc_max_packet_count = 3;
 	parm->hc_max_frame_size = 3 * 0x500;
+
+	/* Host buffer DMA needs bus addresses for the frame buffers. */
+	if (DWC_OTG_BUS2SC(parm->udev->bus)->sc_host_dma &&
+	    parm->udev->flags.usb_mode == USB_MODE_HOST)
+		xfer->flags_int.bdma_enable = 1;
 
 	usbd_transfer_setup_sub(parm);
 

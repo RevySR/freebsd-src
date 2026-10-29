@@ -33,6 +33,7 @@
 #define	DWC_OTG_MAX_TXP 4
 #define	DWC_OTG_MAX_TXN (0x200 * DWC_OTG_MAX_TXP)
 #define	DWC_OTG_MAX_CHANNELS 16
+#define	DWC_OTG_DMA_BOUNCE_SIZE 16384
 #define	DWC_OTG_MAX_ENDPOINTS 16
 #define	DWC_OTG_HOST_TIMER_RATE 10 /* ms */
 #define	DWC_OTG_TT_SLOT_MAX 8
@@ -175,8 +176,11 @@ struct dwc_otg_softc {
 	bus_space_handle_t sc_io_hdl;
 
 	uint32_t sc_bounce_buffer[MAX(512 * DWC_OTG_MAX_TXP, 1024) / 4];
+	struct usb_page_cache sc_dma_pc[DWC_OTG_MAX_CHANNELS];
+	struct usb_page sc_dma_pg[DWC_OTG_MAX_CHANNELS];
 
 	uint32_t sc_fifo_size;
+	uint32_t sc_fifo_reset[3];	/* GRXFSIZ, GNPTXFSIZ, HPTXFSIZ */
 	uint32_t sc_irq_mask;
 	uint32_t sc_last_rx_status;
 	uint32_t sc_out_ctl[DWC_OTG_MAX_ENDPOINTS];
@@ -210,6 +214,7 @@ struct dwc_otg_softc {
 #define	DWC_MODE_OTG 0		/* both modes */
 #define	DWC_MODE_DEVICE 1	/* device only */
 #define	DWC_MODE_HOST  2	/* host only */
+	uint8_t	sc_host_dma;		/* host buffer DMA enabled */
 
 	uint8_t	sc_hub_idata[1];
 
