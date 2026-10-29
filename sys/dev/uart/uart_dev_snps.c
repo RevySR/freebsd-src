@@ -48,7 +48,7 @@ struct snps_softc {
 
 	clk_t			baudclk;
 	clk_t			apb_pclk;
-	hwreset_t		reset;
+	hwreset_array_t		resets;
 };
 
 /*
@@ -160,7 +160,7 @@ snps_probe(device_t dev)
 	uint64_t freq;
 	int error;
 	clk_t baudclk, apb_pclk;
-	hwreset_t reset;
+	hwreset_array_t resets;
 
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
@@ -182,10 +182,13 @@ snps_probe(device_t dev)
 	if (OF_getencprop(node, "clock-frequency", &clock, sizeof(clock)) <= 0)
 		clock = 0;
 
-	if (hwreset_get_by_ofw_idx(dev, 0, 0, &reset) == 0) {
-		error = hwreset_deassert(reset);
+	/* Some integrations have separate APB and serial clock resets. */
+	resets = NULL;
+	if (hwreset_array_get_ofw(dev, 0, &resets) == 0) {
+		error = hwreset_array_deassert(resets);
 		if (error != 0) {
-			device_printf(dev, "cannot de-assert reset\n");
+			device_printf(dev, "cannot de-assert resets\n");
+			hwreset_array_release(resets);
 			return (error);
 		}
 	}
@@ -228,7 +231,7 @@ snps_probe(device_t dev)
 	/* Store clock and reset handles for detach */
 	sc->baudclk = baudclk;
 	sc->apb_pclk = apb_pclk;
-	sc->reset = reset;
+	sc->resets = resets;
 
 	return (BUS_PROBE_VENDOR);
 }
@@ -254,25 +257,25 @@ snps_detach(device_t dev)
 {
 	struct snps_softc *sc;
 	clk_t baudclk, apb_pclk;
-	hwreset_t reset;
+	hwreset_array_t resets;
 	int error;
 
 	sc = device_get_softc(dev);
 	baudclk = sc->baudclk;
 	apb_pclk = sc->apb_pclk;
-	reset = sc->reset;
+	resets = sc->resets;
 
 	error = uart_bus_detach(dev);
 	if (error != 0)
 		return (error);
 
-	if (reset != NULL) {
-		error = hwreset_assert(reset);
+	if (resets != NULL) {
+		error = hwreset_array_assert(resets);
 		if (error != 0) {
-			device_printf(dev, "cannot assert reset\n");
+			device_printf(dev, "cannot assert resets\n");
 			return (error);
 		}
-		hwreset_release(reset);
+		hwreset_array_release(resets);
 	}
 	if (apb_pclk != NULL) {
 		error = clk_release(apb_pclk);
