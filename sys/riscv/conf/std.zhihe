@@ -1,0 +1,15 @@
+#
+# Zhihe SoC support
+#
+
+# The E902 management firmware provides clocks, resets and power over SCMI.
+device		scmi
+device		mmio_sram
+
+device		uart_snps	# DesignWare Synopsis UART driver
+device		dwcotg		# DesignWare USB 2.0 OTG controller
+device		dwc3		# DesignWare USB 3 DRD controller (host)
+device		ig4		# DesignWare I2C controller
+device		tca64xx		# I2C GPIO expanders
+
+files		"../zhihe/files.zhihe"
