@@ -4,13 +4,25 @@ cddl/dev/dtrace/riscv/dtrace_subr.c			optional dtrace compile-with "${DTRACE_C}"
 cddl/dev/dtrace/riscv/instr_size.c			optional dtrace compile-with "${DTRACE_C}"
 cddl/dev/fbt/riscv/fbt_isa.c				optional dtrace_fbt | dtraceall compile-with "${FBT_C}"
 crypto/des/des_enc.c		optional	netsmb
+dev/ahci/ahci_generic.c		optional	ahci fdt
 dev/cpufreq/cpufreq_dt.c	optional	cpufreq fdt
+dev/firmware/arm/scmi.c		optional	fdt scmi
+dev/firmware/arm/scmi_clk.c	optional	fdt scmi
+dev/firmware/arm/scmi_if.m	optional	fdt scmi
+dev/firmware/arm/scmi_mailbox.c	optional	fdt scmi
+dev/firmware/arm/scmi_power.c	optional	fdt scmi
+dev/firmware/arm/scmi_reset.c	optional	fdt scmi hwreset
+dev/firmware/arm/scmi_shmem.c	optional	fdt scmi
+dev/mailbox/arm/arm_doorbell.c	optional	fdt scmi
+dev/mbox/mbox_if.m		optional	fdt scmi
 dev/ofw/ofw_pci.c		optional 	pci fdt
 dev/ofw/ofw_pcib.c		optional 	pci fdt
 dev/pci/pci_dw.c		optional	pci fdt
 dev/pci/pci_dw_if.m		optional	pci fdt
 dev/pci/pci_host_generic.c	optional	pci
 dev/pci/pci_host_generic_fdt.c	optional	pci fdt
+dev/sram/mmio_sram.c		optional	fdt mmio_sram
+dev/sram/mmio_sram_if.m		optional	fdt mmio_sram
 dev/uart/uart_cpu_fdt.c		optional	uart fdt
 dev/uart/uart_dev_lowrisc.c	optional	uart_lowrisc
 dev/usb/controller/generic_ehci.c		optional ehci
@@ -19,6 +31,7 @@ dev/usb/controller/generic_ohci.c		optional ohci fdt
 dev/usb/controller/generic_usb_if.m		optional ohci fdt
 dev/usb/controller/generic_xhci.c		optional xhci
 dev/usb/controller/generic_xhci_fdt.c		optional xhci fdt
+dev/usb/controller/dwc3/dwc3.c			optional xhci fdt dwc3
 dev/vmm/vmm_dev.c		optional	vmm
 dev/vmm/vmm_mem.c		optional	vmm
 dev/vmm/vmm_stat.c		optional	vmm
