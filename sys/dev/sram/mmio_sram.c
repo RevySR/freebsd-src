@@ -80,16 +80,24 @@ mmio_sram_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 
-	if (bus_alloc_resources(dev, mmio_sram_spec, sc->res) != 0) {
-		device_printf(dev, "Can't allocate resources for device.\n");
-		return (ENXIO);
-	}
-
 	node = ofw_bus_get_node(dev);
 	if (node == -1)
 		return (ENXIO);
 
-	rv = simplebus_attach_impl(dev, SB_FLAG_NO_RANGES, node);
+	/*
+	 * Partitions described by child nodes map their own part of the
+	 * SRAM. Overlapping memory resources cannot be shared, so only map
+	 * the whole SRAM when there are no partitions.
+	 */
+	if (OF_child(node) == 0 &&
+	    bus_alloc_resources(dev, mmio_sram_spec, sc->res) != 0) {
+		device_printf(dev, "Can't allocate resources for device.\n");
+		return (ENXIO);
+	}
+
+	/* Child regions are offsets into the SRAM, mapped through ranges. */
+	rv = simplebus_attach_impl(dev,
+	    OF_hasprop(node, "ranges") ? 0 : SB_FLAG_NO_RANGES, node);
 	if (rv != 0)
 		return (rv);
 
@@ -104,7 +112,8 @@ mmio_sram_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 
-	bus_release_resources(dev, mmio_sram_spec, sc->res);
+	if (sc->res[0] != NULL)
+		bus_release_resources(dev, mmio_sram_spec, sc->res);
 
 	return (0);
 }
