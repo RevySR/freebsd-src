@@ -153,6 +153,7 @@ DRIVER_MODULE(tca64xx, iicbus, tca64xx_driver, 0, 0);
 MODULE_VERSION(tca64xx, 1);
 
 static struct ofw_compat_data compat_data[] = {
+	{"awinic,aw9535",	TCA6416_TYPE},
 	{"nxp,pca9555",	TCA6416_TYPE},
 	{"ti,tca6408",	TCA6408_TYPE},
 	{"ti,tca6416",	TCA6416_TYPE},
