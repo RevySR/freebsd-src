@@ -95,6 +95,10 @@ shmem_attach(device_t dev)
 	rid = 0;
 	sc->res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
 	    RF_ACTIVE | RF_SHAREABLE);
+	if (sc->res == NULL) {
+		device_printf(dev, "Cannot allocate memory resource.\n");
+		return (ENXIO);
+	}
 
 	atomic_store_rel_int(&sc->inflight, INFLIGHT_NONE);
 
