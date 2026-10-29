@@ -56,6 +56,7 @@ struct eqos_dma_desc {
 struct eqos_bufmap {
 	bus_dmamap_t		map;
 	struct mbuf		*mbuf;
+	bus_addr_t		paddr;
 };
 
 struct eqos_ring {

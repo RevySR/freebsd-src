@@ -352,6 +352,7 @@ eqos_setup_rxbuf(struct eqos_softc *sc, int index, struct mbuf *m)
 	    BUS_DMASYNC_PREREAD);
 
 	sc->rx.buf_map[index].mbuf = m;
+	sc->rx.buf_map[index].paddr = seg.ds_addr;
 	eqos_setup_rxdesc(sc, index, seg.ds_addr);
 
 	return (0);
@@ -471,12 +472,44 @@ eqos_reset(struct eqos_softc *sc)
 static void
 eqos_init_rings(struct eqos_softc *sc)
 {
+	struct eqos_bufmap *bmap;
+	int i;
+
+	/*
+	 * Both DMA channels restart at the base of their rings.  Drop the
+	 * frames still queued for transmission and return all transmit
+	 * descriptors to the driver.  The DMA fetches transmit descriptors
+	 * until it reaches the tail pointer, so keep that at the base until
+	 * eqos_start_locked() hands over complete frames.
+	 */
+	for (i = 0; i < TX_DESC_COUNT; i++) {
+		bmap = &sc->tx.buf_map[i];
+		if (bmap->mbuf != NULL) {
+			bus_dmamap_sync(sc->tx.buf_tag, bmap->map,
+			    BUS_DMASYNC_POSTWRITE);
+			bus_dmamap_unload(sc->tx.buf_tag, bmap->map);
+			m_freem(bmap->mbuf);
+			bmap->mbuf = NULL;
+		}
+		eqos_setup_txdesc(sc, i, 0, 0, 0, 0);
+	}
+	sc->tx.head = sc->tx.tail = 0;
+
+	/* Return every loaded receive buffer to the DMA. */
+	for (i = 0; i < RX_DESC_COUNT; i++) {
+		bmap = &sc->rx.buf_map[i];
+		if (bmap->paddr != 0)
+			eqos_setup_rxdesc(sc, i, bmap->paddr);
+	}
+	sc->rx.head = 0;
 
 	WR4(sc, GMAC_DMA_CHAN0_TX_BASE_ADDR_HI,
 	    (uint32_t)(sc->tx.desc_ring_paddr >> 32));
 	WR4(sc, GMAC_DMA_CHAN0_TX_BASE_ADDR,
 	    (uint32_t)sc->tx.desc_ring_paddr);
 	WR4(sc, GMAC_DMA_CHAN0_TX_RING_LEN, TX_DESC_COUNT - 1);
+	WR4(sc, GMAC_DMA_CHAN0_TX_END_ADDR,
+	    (uint32_t)sc->tx.desc_ring_paddr);
 
 	WR4(sc, GMAC_DMA_CHAN0_RX_BASE_ADDR_HI,
 	    (uint32_t)(sc->rx.desc_ring_paddr >> 32));
@@ -748,6 +781,7 @@ eqos_rxintr(struct eqos_softc *sc)
 		    sc->rx.buf_map[sc->rx.head].map, BUS_DMASYNC_POSTREAD);
 		bus_dmamap_unload(sc->rx.buf_tag,
 		    sc->rx.buf_map[sc->rx.head].map);
+		sc->rx.buf_map[sc->rx.head].paddr = 0;
 
 		length = rdes3 & EQOS_RDES3_LENGTH_MASK;
 		if (length && !error_status) {
@@ -1107,7 +1141,6 @@ eqos_setup_dma(struct eqos_softc *sc)
 			device_printf(sc->dev, "cannot create TX buffer map\n");
 			return (error);
 		}
-		eqos_setup_txdesc(sc, i, EQOS_TDES3_OWN, 0, 0, 0);
 	}
 
 	/* Set up RX descriptor ring, descriptors, dma maps, and mbufs */
