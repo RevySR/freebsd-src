@@ -65,6 +65,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <dev/clk/clk.h>
+#include <dev/hwreset/hwreset.h>
 #include <dev/phy/phy_usb.h>
 #endif
 
@@ -284,6 +285,15 @@ snps_dwc3_configure_host(struct snps_dwc3_softc *sc)
 	reg = DWC3_READ(sc, DWC3_GUCTL);
 	reg |= DWC3_GUCTL_HOST_AUTO_RETRY;
 	DWC3_WRITE(sc, DWC3_GUCTL, reg);
+
+	/*
+	 * The xHCI host and the device-mode event buffer share one
+	 * interrupt line.  Mask the device-mode event interrupt, which
+	 * nothing services in host mode.
+	 */
+	reg = DWC3_READ(sc, DWC3_GEVNTSIZ0);
+	reg |= DWC3_GEVNTSIZ_INTMASK;
+	DWC3_WRITE(sc, DWC3_GEVNTSIZ0, reg);
 }
 
 #ifdef FDT
@@ -398,6 +408,7 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 #ifdef FDT
 	phandle_t node;
 	phy_t usb2_phy, usb3_phy;
+	hwreset_array_t rsts;
 	uint32_t reg;
 #endif
 	int error, rid;
@@ -460,6 +471,13 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 			device_printf(dev, "Cannot get suspend_clk\n");
 		if (clk_get_by_ofw_name(dev, node, "bus_clk", &sc->clk_bus) != 0)
 			device_printf(dev, "Cannot get bus_clk\n");
+	} else {
+		/* Clock names from the snps,dwc3 binding, all optional. */
+		(void)clk_get_by_ofw_name(dev, node, "ref", &sc->clk_ref);
+		(void)clk_get_by_ofw_name(dev, node, "suspend",
+		    &sc->clk_suspend);
+		(void)clk_get_by_ofw_name(dev, node, "bus_early",
+		    &sc->clk_bus);
 	}
 
 	if (sc->clk_ref != NULL) {
@@ -483,6 +501,15 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 	error = phy_get_by_ofw_name(dev, node, "usb3-phy", &usb3_phy);
 	if (error == 0 && usb3_phy != NULL)
 		phy_enable(usb3_phy);
+
+	/*
+	 * The C10 PHY handshake completes when the controller leaves reset,
+	 * so keep the external reset asserted until both PHYs are configured.
+	 */
+	if (hwreset_array_get_ofw(dev, node, &rsts) == 0 &&
+	    hwreset_array_deassert(rsts) != 0)
+		device_printf(dev, "Cannot deassert resets\n");
+
 	if (sc->snpsversion == DWC3_IP_ID) {
 		if (sc->snpsrevision >= 0x290A) {
 			uint32_t hwparams3;
