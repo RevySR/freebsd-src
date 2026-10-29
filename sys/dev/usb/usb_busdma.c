@@ -734,6 +734,34 @@ usb_pc_cpu_invalidate(struct usb_page_cache *pc)
 }
 
 /*------------------------------------------------------------------------*
+ *	usb_pc_cpu_preread - synchronize before device writes to memory
+ *------------------------------------------------------------------------*/
+static void
+usb_pc_cpu_preread(struct usb_page_cache *pc)
+{
+	if (pc->page_offset_end == pc->page_offset_buf) {
+		/* nothing has been loaded into this page cache! */
+		return;
+	}
+
+	bus_dmamap_sync(pc->tag, pc->map, BUS_DMASYNC_PREREAD);
+}
+
+/*------------------------------------------------------------------------*
+ *	usb_pc_cpu_postread - synchronize after device writes to memory
+ *------------------------------------------------------------------------*/
+static void
+usb_pc_cpu_postread(struct usb_page_cache *pc)
+{
+	if (pc->page_offset_end == pc->page_offset_buf) {
+		/* nothing has been loaded into this page cache! */
+		return;
+	}
+
+	bus_dmamap_sync(pc->tag, pc->map, BUS_DMASYNC_POSTREAD);
+}
+
+/*------------------------------------------------------------------------*
  *	usb_pc_cpu_flush - flush CPU cache
  *------------------------------------------------------------------------*/
 void
@@ -1067,9 +1095,14 @@ usb_bdma_pre_sync(struct usb_xfer *xfer)
 
 	pc = xfer->frbuffers;
 
+	/*
+	 * Do not issue POSTREAD here.  PREREAD preserves dirty data adjacent
+	 * to an unaligned external buffer before invalidating its cache lines;
+	 * an invalidate first can discard that data on non-coherent systems.
+	 */
 	while (nframes--) {
 		if (pc->isread) {
-			usb_pc_cpu_invalidate(pc);
+			usb_pc_cpu_preread(pc);
 		} else {
 			usb_pc_cpu_flush(pc);
 		}
@@ -1101,7 +1134,7 @@ usb_bdma_post_sync(struct usb_xfer *xfer)
 
 	while (nframes--) {
 		if (pc->isread) {
-			usb_pc_cpu_invalidate(pc);
+			usb_pc_cpu_postread(pc);
 		}
 		pc++;
 	}
