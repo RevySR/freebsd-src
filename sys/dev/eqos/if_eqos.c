@@ -1162,7 +1162,11 @@ eqos_attach(device_t dev)
 	uint8_t eaddr[ETHER_ADDR_LEN];
 	u_int userver, snpsver;
 	int error;
-	int n;
+	int n, phy;
+#ifdef FDT
+	phandle_t phy_xref;
+	pcell_t phy_addr;
+#endif
 
 	/* default values */
 	sc->thresh_dma_mode = false;
@@ -1248,9 +1252,20 @@ eqos_attach(device_t dev)
 	if_setcapabilities(ifp, IFCAP_VLAN_MTU /*| IFCAP_HWCSUM*/);
 	if_setcapenable(ifp, if_getcapabilities(ifp));
 
-	/* Attach MII driver */
+	/*
+	 * Attach MII driver. Use the PHY address from the device tree when
+	 * there is one: some PHYs also answer at the broadcast address 0.
+	 */
+	phy = MII_PHY_ANY;
+#ifdef FDT
+	if (OF_getencprop(ofw_bus_get_node(sc->dev), "phy-handle", &phy_xref,
+	    sizeof(phy_xref)) > 0 &&
+	    OF_getencprop(OF_node_from_xref(phy_xref), "reg", &phy_addr,
+	    sizeof(phy_addr)) > 0 && phy_addr < MII_NPHY)
+		phy = phy_addr;
+#endif
 	if ((error = mii_attach(sc->dev, &sc->miibus, ifp, eqos_media_change,
-	    eqos_media_status, BMSR_DEFCAPMASK, MII_PHY_ANY,
+	    eqos_media_status, BMSR_DEFCAPMASK, phy,
 	    MII_OFFSET_ANY, 0))) {
 		device_printf(sc->dev, "PHY attach failed\n");
 		return (ENXIO);
