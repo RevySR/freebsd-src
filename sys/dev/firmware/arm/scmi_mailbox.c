@@ -44,6 +44,7 @@
 
 #include "dev/mailbox/arm/arm_doorbell.h"
 
+#include "mbox_if.h"
 #include "scmi.h"
 #include "scmi_protocols.h"
 #include "scmi_shmem.h"
@@ -53,7 +54,9 @@
 struct scmi_mailbox_softc {
 	struct scmi_softc	base;
 	device_t		a2p_dev;
-	struct arm_doorbell	*db;
+	struct arm_doorbell	*db;		/* ARM MHU doorbell */
+	device_t		mbox_dev;	/* Other mailboxes */
+	int			mbox_chan;
 };
 
 static int	scmi_mailbox_transport_init(device_t);
@@ -80,11 +83,44 @@ scmi_mailbox_a2p_callback(void *arg)
 		scmi_rx_irq_callback(sc->base.dev, sc->a2p_dev, msg_header, rx_len);
 }
 
+/*
+ * Find the "tx" mailbox. ARM MHU doorbells are handled by arm_doorbell;
+ * other controllers implement the mbox interface, where a write to the
+ * channel rings the doorbell.
+ */
+static int
+scmi_mailbox_ofw_get(device_t dev, phandle_t node, device_t *mbox,
+    int *chan)
+{
+	phandle_t provider;
+	pcell_t *cells;
+	int error, idx, ncells;
+
+	if (ofw_bus_find_string_index(node, "mbox-names", "tx", &idx) != 0)
+		idx = 0;
+	error = ofw_bus_parse_xref_list_alloc(node, "mboxes", "#mbox-cells",
+	    idx, &provider, &ncells, &cells);
+	if (error != 0)
+		return (error);
+
+	error = ENOENT;
+	if (!ofw_bus_node_is_compatible(OF_node_from_xref(provider),
+	    "arm,mhu-doorbell")) {
+		*mbox = OF_device_from_xref(provider);
+		*chan = ncells > 0 ? cells[0] : 0;
+		error = *mbox == NULL ? ENXIO : 0;
+	}
+	OF_prop_free(cells);
+
+	return (error);
+}
+
 static int
 scmi_mailbox_transport_init(device_t dev)
 {
 	struct scmi_mailbox_softc *sc;
 	phandle_t node;
+	int error;
 
 	sc = device_get_softc(dev);
 
@@ -102,14 +138,26 @@ scmi_mailbox_transport_init(device_t dev)
 		return (ENXIO);
 	}
 
+	sc->base.trs_desc.reply_timo_ms = 30;
+
+	error = scmi_mailbox_ofw_get(dev, node, &sc->mbox_dev,
+	    &sc->mbox_chan);
+	if (error == 0) {
+		/* Replies are polled for in shared memory. */
+		sc->base.trs_desc.no_completion_irq = true;
+		return (0);
+	}
+	if (error != ENOENT) {
+		device_printf(dev, "Mailbox device not found.\n");
+		return (ENXIO);
+	}
+
 	/* TODO: Fix ofw_get...mbox doorbell names NOT required in Linux DT */
 	sc->db = arm_doorbell_ofw_get(dev, "tx");
 	if (sc->db == NULL) {
 		device_printf(dev, "Doorbell device not found.\n");
 		return (ENXIO);
 	}
-
-	sc->base.trs_desc.reply_timo_ms = 30;
 
 	arm_doorbell_set_handler(sc->db, scmi_mailbox_a2p_callback, sc);
 
@@ -123,7 +171,8 @@ scmi_mailbox_transport_cleanup(device_t dev)
 
 	sc = device_get_softc(dev);
 
-	arm_doorbell_set_handler(sc->db, NULL, NULL);
+	if (sc->db != NULL)
+		arm_doorbell_set_handler(sc->db, NULL, NULL);
 }
 
 static int
@@ -140,9 +189,12 @@ scmi_mailbox_xfer_msg(device_t dev, struct scmi_msg *msg)
 		return (ret);
 
 	/* Interrupt SCP firmware. */
-	arm_doorbell_set(sc->db);
+	if (sc->db != NULL)
+		arm_doorbell_set(sc->db);
+	else
+		ret = MBOX_WRITE(sc->mbox_dev, sc->mbox_chan, 0);
 
-	return (0);
+	return (ret);
 }
 
 static int

@@ -473,7 +473,7 @@ dev/ixl/i40e_dcb.c		optional	ixl pci \
 	compile-with "${NORMAL_C} -I$S/dev/ixl"
 
 dev/mailbox/arm/arm_doorbell.c			optional fdt arm_doorbell
-dev/mbox/mbox_if.m				optional soc_brcm_bcm2837
+dev/mbox/mbox_if.m				optional soc_brcm_bcm2837 | fdt scmi
 
 dev/mmc/host/dwmmc_altera.c			optional dwmmc dwmmc_altera fdt
 dev/mmc/host/dwmmc_hisi.c			optional dwmmc dwmmc_hisi fdt
