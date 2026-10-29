@@ -827,6 +827,7 @@ static void
 ig4iic_get_config(ig4iic_softc_t *sc)
 {
 	const struct ig4_hw *hw;
+	struct ig4_hw hw_clock;
 	uint32_t v;
 #ifdef DEV_ACPI
 	ACPI_HANDLE handle;
@@ -860,7 +861,13 @@ ig4iic_get_config(ig4iic_softc_t *sc)
 	/* Override hardware config with IC_clock-based counter values */
 	if (ig4_timings < 2 && sc->version < nitems(ig4iic_hw)) {
 		hw = &ig4iic_hw[sc->version];
-		sc->cfg.bus_speed = IG4_CTL_SPEED_FAST;
+		if (sc->ic_clock_rate != 0) {
+			hw_clock = *hw;
+			hw_clock.ic_clock_rate = sc->ic_clock_rate;
+			hw = &hw_clock;
+		}
+		sc->cfg.bus_speed = sc->std_speed ? IG4_CTL_SPEED_STD :
+		    IG4_CTL_SPEED_FAST;
 		ig4iic_clk_params(hw, IG4_CTL_SPEED_STD, &sc->cfg.ss_scl_hcnt,
 		    &sc->cfg.ss_scl_lcnt, &sc->cfg.ss_sda_hold);
 		ig4iic_clk_params(hw, IG4_CTL_SPEED_FAST, &sc->cfg.fs_scl_hcnt,

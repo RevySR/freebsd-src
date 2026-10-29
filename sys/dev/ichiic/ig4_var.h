@@ -43,6 +43,7 @@
 
 enum ig4_vers {
 	IG4_EMAG,
+	IG4_FDT,	/* Input clock and bus speed from the device tree */
 	IG4_HASWELL,
 	IG4_ATOM,
 	IG4_SKYLAKE,
@@ -87,6 +88,8 @@ struct ig4iic_softc {
 	void		*intr_handle;
 	int		intr_type;
 	enum ig4_vers	version;
+	uint32_t	ic_clock_rate;	/* MHz, overrides the version default */
+	bool		std_speed;	/* Limit the bus to standard speed */
 	struct ig4_cfg	cfg;
 	uint32_t	intr_mask;
 	uint8_t		last_slave;
