@@ -50,6 +50,7 @@
 #define	DOTG_GSNPSID		0x0040
 #define	DOTG_GSNPSID_REV_2_80a	0x4f54280a	/* RPi model B/RPi2 */
 #define	DOTG_GSNPSID_REV_3_10a	0x4f54310a	/* ODROID-C1 */
+#define	DOTG_GSNPSID_REV_4_20a	0x4f54420a
 #define	DOTG_GHWCFG1		0x0044
 #define	DOTG_GHWCFG2		0x0048
 #define	DOTG_GHWCFG3		0x004C
@@ -209,6 +210,7 @@
 
 #define	GRSTCTL_AHBIDLE			(1<<31)
 #define	GRSTCTL_DMAREQ			(1<<30)
+#define	GRSTCTL_CSFTRST_DONE		(1<<29)	/* 4.20a and later */
 #define	GRSTCTL_TXFNUM_MASK		0x000007c0
 #define	GRSTCTL_TXFNUM_SHIFT		6
 #define	GRSTCTL_TXFIFO(n)		(((n) & 31) << 6)

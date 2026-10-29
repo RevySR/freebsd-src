@@ -3834,7 +3834,9 @@ dwc_otg_device_state_change(struct usb_device *udev)
 int
 dwc_otg_init(struct dwc_otg_softc *sc)
 {
+	uint32_t snpsid;
 	uint32_t temp;
+	uint8_t x;
 	int err;
 
 	DPRINTF("start\n");
@@ -3878,8 +3880,8 @@ dwc_otg_init(struct dwc_otg_softc *sc)
 	/* turn on clocks */
 	dwc_otg_clocks_on(sc);
 
-	temp = DWC_OTG_READ_4(sc, DOTG_GSNPSID);
-	DPRINTF("Version = 0x%08x\n", temp);
+	snpsid = DWC_OTG_READ_4(sc, DOTG_GSNPSID);
+	DPRINTF("Version = 0x%08x\n", snpsid);
 
 	/* disconnect */
 	DWC_OTG_WRITE_4(sc, DOTG_DCTL,
@@ -3893,6 +3895,26 @@ dwc_otg_init(struct dwc_otg_softc *sc)
 
 	/* wait a little bit for block to reset */
 	usb_pause_mtx(&sc->sc_bus.bus_mtx, hz / 128);
+
+	/*
+	 * Starting with 4.20a the core stays in reset until software
+	 * acknowledges the completion of the soft reset.
+	 */
+	if ((snpsid & 0xffff0000) == 0x4f540000 &&
+	    (snpsid & 0xffff) >= (DOTG_GSNPSID_REV_4_20a & 0xffff)) {
+		for (x = 0; x != 100; x++) {
+			temp = DWC_OTG_READ_4(sc, DOTG_GRSTCTL);
+			if (temp & GRSTCTL_CSFTRST_DONE)
+				break;
+			DELAY(10);
+		}
+		if (x == 100)
+			device_printf(sc->sc_bus.parent,
+			    "soft reset did not complete\n");
+		temp &= ~GRSTCTL_CSFTRST;
+		temp |= GRSTCTL_CSFTRST_DONE;
+		DWC_OTG_WRITE_4(sc, DOTG_GRSTCTL, temp);
+	}
 
 	switch (sc->sc_mode) {
 	case DWC_MODE_DEVICE:
