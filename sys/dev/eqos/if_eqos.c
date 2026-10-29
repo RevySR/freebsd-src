@@ -494,7 +494,7 @@ eqos_init(void *if_softc)
 	struct eqos_softc *sc = if_softc;
 	if_t ifp = sc->ifp;
 	struct mii_data *mii = device_get_softc(sc->miibus);
-	uint32_t val, mtl_tx_val, mtl_rx_val;
+	uint32_t val, mtl_tx_val, mtl_rx_val, rx_fifo, tx_fifo;
 
 	if (if_getdrvflags(ifp) & IFF_DRV_RUNNING)
 		return;
@@ -541,6 +541,41 @@ eqos_init(void *if_softc)
 	} else {
 		mtl_tx_val = GMAC_MTL_TXQ0_OPERATION_MODE_TSF;
 		mtl_rx_val = GMAC_MTL_RXQ0_OPERATION_MODE_RSF;
+	}
+
+	/*
+	 * Only queue 0 is used, so give it the whole FIFOs. With several
+	 * queues the sizes reset to 256 bytes, too small for store and
+	 * forward of full frames; with one queue the fields are read-only.
+	 * The FIFO sizes are encoded as 128 << n bytes, the queue sizes in
+	 * 256 byte blocks minus one.
+	 */
+	tx_fifo = 128U << ((sc->hw_feature[1] &
+	    GMAC_MAC_HW_FEATURE1_TXFIFOSIZE_MASK) >>
+	    GMAC_MAC_HW_FEATURE1_TXFIFOSIZE_SHIFT);
+	rx_fifo = 128U << (sc->hw_feature[1] &
+	    GMAC_MAC_HW_FEATURE1_RXFIFOSIZE_MASK);
+	if (tx_fifo >= 256)
+		mtl_tx_val |= ((tx_fifo / 256 - 1) <<
+		    GMAC_MTL_TXQ0_OPERATION_MODE_TQS_SHIFT) &
+		    GMAC_MTL_TXQ0_OPERATION_MODE_TQS_MASK;
+	if (rx_fifo >= 256)
+		mtl_rx_val |= ((rx_fifo / 256 - 1) <<
+		    GMAC_MTL_RXQ0_OPERATION_MODE_RQS_SHIFT) &
+		    GMAC_MTL_RXQ0_OPERATION_MODE_RQS_MASK;
+
+	/*
+	 * Send PAUSE frames before the RX FIFO overflows. The thresholds
+	 * count down from a full FIFO in 512 byte steps, starting at 1 KB:
+	 * activate at full-1.5K and deactivate at full-2.5K for 4 KB FIFOs,
+	 * full-3K and full-4.5K for larger ones.
+	 */
+	if (rx_fifo >= 4096) {
+		mtl_rx_val |= GMAC_MTL_RXQ0_OPERATION_MODE_EHFC;
+		mtl_rx_val |= (rx_fifo == 4096 ? 0x1 : 0x4) <<
+		    GMAC_MTL_RXQ0_OPERATION_MODE_RFA_SHIFT;
+		mtl_rx_val |= (rx_fifo == 4096 ? 0x3 : 0x7) <<
+		    GMAC_MTL_RXQ0_OPERATION_MODE_RFD_SHIFT;
 	}
 
 	WR4(sc, GMAC_MTL_TXQ0_OPERATION_MODE,
