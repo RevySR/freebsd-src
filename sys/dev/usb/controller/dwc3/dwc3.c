@@ -326,11 +326,16 @@ snps_dwc3_do_quirks(struct snps_dwc3_softc *sc)
 		reg &= ~DWC3_GUSB2PHYCFG0_U2_FREECLK_EXISTS;
 	else
 		reg |= DWC3_GUSB2PHYCFG0_U2_FREECLK_EXISTS;
-	if (device_has_property(sc->dev, "snps,dis_u2_susphy_quirk"))
+	if (device_has_property(sc->dev, "snps,dis_u2_susphy_quirk")) {
 		reg &= ~DWC3_GUSB2PHYCFG0_SUSPENDUSB20;
-	else if ((ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
-	    DWC3_GHWPARAMS0_MODE_DUALROLEDEVICE)
-		reg |= DWC3_GUSB2PHYCFG0_SUSPENDUSB20;
+	} else if ((ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
+	    DWC3_GHWPARAMS0_MODE_DUALROLEDEVICE) {
+		/*
+		 * The driver always runs the core as a host, which must keep
+		 * the PHY out of suspend to detect connections.
+		 */
+		reg &= ~DWC3_GUSB2PHYCFG0_SUSPENDUSB20;
+	}
 	if (device_has_property(sc->dev, "snps,dis_enblslpm_quirk"))
 		reg &= ~DWC3_GUSB2PHYCFG0_ENBLSLPM;
 	else
@@ -347,11 +352,12 @@ snps_dwc3_do_quirks(struct snps_dwc3_softc *sc)
 		reg &= ~DWC3_GUSB3PIPECTL0_DELAYP1TRANS;
 	if (device_has_property(sc->dev, "snps,dis_rxdet_inp3_quirk"))
 		reg |= DWC3_GUSB3PIPECTL0_DISRXDETINP3;
-	if (device_has_property(sc->dev, "snps,dis_u3_susphy_quirk"))
+	if (device_has_property(sc->dev, "snps,dis_u3_susphy_quirk")) {
 		reg &= ~DWC3_GUSB3PIPECTL0_SUSPENDUSB3;
-	else if ((ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
-	    DWC3_GHWPARAMS0_MODE_DUALROLEDEVICE)
-		reg |= DWC3_GUSB3PIPECTL0_SUSPENDUSB3;
+	} else if ((ghwp0 & DWC3_GHWPARAMS0_MODE_MASK) ==
+	    DWC3_GHWPARAMS0_MODE_DUALROLEDEVICE) {
+		reg &= ~DWC3_GUSB3PIPECTL0_SUSPENDUSB3;
+	}
 	DWC3_WRITE(sc, DWC3_GUSB3PIPECTL0, reg);
 
 	/* Port Disable does not work on <= 3.00a. Disable PORT_PED. */
@@ -373,7 +379,8 @@ snps_dwc3_probe_common(device_t dev)
 		device_printf(dev, "Cannot determine dr_mode\n");
 		return (ENXIO);
 	}
-	if (strcmp(dr_mode, "host") != 0) {
+	/* Without device mode support, a dual-role port can only be a host. */
+	if (strcmp(dr_mode, "host") != 0 && strcmp(dr_mode, "otg") != 0) {
 		device_printf(dev,
 		    "Found dr_mode '%s' but only 'host' supported. s=%zd\n",
 		    dr_mode, s);
