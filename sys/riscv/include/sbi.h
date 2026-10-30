@@ -243,6 +243,7 @@ sbi_console_getchar(void)
 
 void sbi_print_version(void);
 void sbi_init(void);
+void sbi_get_hart_ids(register_t *vendor, register_t *arch, register_t *impl);
 
 #endif /* !LOCORE */
 #endif /* !_MACHINE_SBI_H_ */

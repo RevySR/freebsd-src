@@ -106,6 +106,7 @@ void	cpu_halt(void) __dead2;
 void	cpu_reset(void) __dead2;
 void	fork_trampoline(void);
 void	identify_cpu(u_int cpu);
+void	identify_cpu_ids(u_int cpu);
 void	printcpuinfo(u_int cpu);
 cpuset_t hartmask_to_cpumask(const cpuset_t);
 

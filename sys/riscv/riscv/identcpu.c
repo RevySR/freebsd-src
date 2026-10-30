@@ -52,6 +52,7 @@
 #include <machine/cpufunc.h>
 #include <machine/elf.h>
 #include <machine/md_var.h>
+#include <machine/sbi.h>
 #include <machine/thead.h>
 #include <machine/cbo.h>
 
@@ -93,6 +94,9 @@ bool has_zicbop;
 static char isa_extensions[PAGE_SIZE];
 
 struct cpu_desc {
+	register_t	mvendorid;
+	register_t	marchid;
+	register_t	mimpid;
 	const char	*cpu_mvendor_name;
 	const char	*cpu_march_name;
 	bool		cpu_march_known;
@@ -569,7 +573,7 @@ update_global_capabilities(u_int cpu, struct cpu_desc *desc)
 }
 
 static void
-identify_cpu_ids(struct cpu_desc *desc)
+identify_cpu_names(struct cpu_desc *desc)
 {
 	const struct marchid_entry *table = NULL;
 	int i;
@@ -583,25 +587,25 @@ identify_cpu_ids(struct cpu_desc *desc)
 	 * table for marchid lookup.
 	 */
 	for (i = 0; i < nitems(mvendor_ids); i++) {
-		if (mvendorid == mvendor_ids[i].mvendor_id) {
+		if (desc->mvendorid == mvendor_ids[i].mvendor_id) {
 			desc->cpu_mvendor_name = mvendor_ids[i].mvendor_name;
 			table = mvendor_ids[i].marchid_table;
 			break;
 		}
 	}
 
-	if (marchid == MARCHID_UNIMPL) {
+	if (desc->marchid == MARCHID_UNIMPL) {
 		desc->cpu_march_name = "Unspecified";
 		return;
 	}
 
-	if (MARCHID_IS_OPENSOURCE(marchid)) {
+	if (MARCHID_IS_OPENSOURCE(desc->marchid)) {
 		table = global_marchids;
 	} else if (table == NULL)
 		return;
 
 	for (i = 0; table[i].march_name != NULL; i++) {
-		if (marchid == table[i].march_id) {
+		if (desc->marchid == table[i].march_id) {
 			desc->cpu_march_name = table[i].march_name;
 			desc->cpu_march_known = true;
 			break;
@@ -642,12 +646,27 @@ handle_cpu_quirks(u_int cpu, struct cpu_desc *desc)
 	}
 }
 
+/*
+ * Read the ID registers of the calling hart.  They differ between core types,
+ * so each AP reads its own before identify_cpu() runs for it on the boot hart.
+ */
+void
+identify_cpu_ids(u_int cpu)
+{
+	struct cpu_desc *desc = &cpu_desc[cpu];
+
+	sbi_get_hart_ids(&desc->mvendorid, &desc->marchid, &desc->mimpid);
+}
+
 void
 identify_cpu(u_int cpu)
 {
 	struct cpu_desc *desc = &cpu_desc[cpu];
 
-	identify_cpu_ids(desc);
+	/* The APs have read their IDs in init_secondary(). */
+	if (cpu == 0)
+		identify_cpu_ids(cpu);
+	identify_cpu_names(desc);
 	identify_cpu_features(cpu, desc);
 
 	/* hw.model describes the boot CPU, as on other architectures. */
@@ -686,9 +705,9 @@ printcpuinfo(u_int cpu)
 	printf("CPU %-3u: Vendor=%s Core=%s (Hart %u)\n", cpu,
 	    desc->cpu_mvendor_name, desc->cpu_march_name, hart);
 
-	/* These values are global. */
-	if (cpu == 0)
-		printf("  marchid=%#lx, mimpid=%#lx\n", marchid, mimpid);
+	if (SHOULD_PRINT(marchid) || SHOULD_PRINT(mimpid))
+		printf("  marchid=%#lx, mimpid=%#lx\n", desc->marchid,
+		    desc->mimpid);
 
 	if (SHOULD_PRINT(mmu_caps)) {
 		printf("  MMU: %#b\n", desc->mmu_caps,

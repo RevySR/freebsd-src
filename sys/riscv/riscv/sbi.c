@@ -285,6 +285,23 @@ sbi_hsm_hart_status(u_long hart)
 	return (ret.error != 0 ? (int)ret.error : (int)ret.value);
 }
 
+/*
+ * Read the ID registers of the calling hart.  A legacy SBI implementation
+ * cannot report them, and they read as zero.
+ */
+void
+sbi_get_hart_ids(register_t *vendor, register_t *arch, register_t *impl)
+{
+	if (sbi_spec_version == 0) {
+		*vendor = *arch = *impl = 0;
+		return;
+	}
+
+	*vendor = sbi_get_mvendorid().value;
+	*arch = sbi_get_marchid().value;
+	*impl = sbi_get_mimpid().value;
+}
+
 void
 sbi_init(void)
 {
@@ -307,9 +324,7 @@ sbi_init(void)
 	sbi_impl_version = sbi_get_impl_version().value;
 
 	/* Set the hardware implementation info. */
-	mvendorid = sbi_get_mvendorid().value;
-	marchid = sbi_get_marchid().value;
-	mimpid = sbi_get_mimpid().value;
+	sbi_get_hart_ids(&mvendorid, &marchid, &mimpid);
 
 	/* Probe for legacy replacement extensions. */
 	if (sbi_probe_extension(SBI_EXT_ID_TIME) != 0)

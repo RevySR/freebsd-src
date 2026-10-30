@@ -177,8 +177,11 @@ init_secondary(uint64_t hart)
 	csr_set(sie, SIE_SSIE);
 	csr_set(sip, SIE_SSIE);
 
+	/* Read the ID registers for identify_cpu(), which runs on the BSP. */
+	identify_cpu_ids(cpuid);
+
 	/* Signal the BSP and spin until it has released all APs. */
-	atomic_add_int(&aps_started, 1);
+	atomic_add_rel_int(&aps_started, 1);
 	while (!atomic_load_int(&aps_ready))
 		__asm __volatile("wfi");
 
@@ -416,7 +419,7 @@ cpu_init_fdt(u_int id, phandle_t node, u_int addr_size, pcell_t *reg)
 	atomic_store_32(&__riscv_boot_ap[hart], 1);
 
 	/* Wait for the AP to switch to its boot stack. */
-	while (atomic_load_int(&aps_started) < naps + 1)
+	while (atomic_load_acq_int(&aps_started) < naps + 1)
 		cpu_spinwait();
 
 	CPU_SET(cpuid, &all_cpus);
