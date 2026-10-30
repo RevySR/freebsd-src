@@ -52,8 +52,10 @@
 #include <dev/pci/pcib_private.h>
 #include <dev/pci/pci_dw.h>
 
+#include "msi_if.h"
 #include "pcib_if.h"
 #include "pci_dw_if.h"
+#include "pic_if.h"
 
 #if 0
 #define	dprintf(fmt, args...) do { printf(fmt,##args); } while (0)
@@ -72,6 +74,14 @@
     bus_write_4((sc)->iatu_ur_res, (sc)->iatu_ur_offset + (reg), (val))
 #define	IATU_UR_RD4(sc, reg)		\
     bus_read_4((sc)->iatu_ur_res, (sc)->iatu_ur_offset + (reg))
+
+#define	DW_MSI_LOCK(sc)		mtx_lock_spin(&(sc)->msi_mtx)
+#define	DW_MSI_UNLOCK(sc)	mtx_unlock_spin(&(sc)->msi_mtx)
+
+struct pci_dw_msi_irqsrc {
+	struct intr_irqsrc	isrc;
+	u_int			irq;
+};
 
 #define	PCI_BUS_SHIFT		20
 #define	PCI_SLOT_SHIFT		15
@@ -607,6 +617,267 @@ pci_dw_write_config(device_t dev, u_int bus, u_int slot,
 	}
 }
 
+/*
+ * Internal MSI controller (iMSI-RX).  It terminates memory writes to the
+ * address in MSI_ADDR, sets the status bit given by the write data and
+ * raises the "msi" interrupt.  Linux uses it when the node names neither
+ * an msi-parent nor an msi-map; do the same if it has an "msi" interrupt.
+ */
+static void
+pci_dw_msi_set_mask(struct pci_dw_softc *sc, u_int irq, bool mask)
+{
+
+	DW_MSI_LOCK(sc);
+	if (mask)
+		sc->msi_mask |= 1u << irq;
+	else
+		sc->msi_mask &= ~(1u << irq);
+	DBI_WR4(sc, DW_MSI_INTR0_MASK, sc->msi_mask);
+	DW_MSI_UNLOCK(sc);
+}
+
+static int
+pci_dw_msi_intr(void *arg)
+{
+	struct pci_dw_softc *sc;
+	struct trapframe *tf;
+	uint32_t status;
+	u_int irq;
+
+	sc = arg;
+	tf = curthread->td_intr_frame;
+	status = DBI_RD4(sc, DW_MSI_INTR0_STATUS) & ~sc->msi_mask;
+	if (status == 0)
+		return (FILTER_STRAY);
+
+	/* Clear before dispatch so that a new message is not lost. */
+	DBI_WR4(sc, DW_MSI_INTR0_STATUS, status);
+	while (status != 0) {
+		irq = ffs(status) - 1;
+		status &= ~(1u << irq);
+		if (intr_isrc_dispatch(&sc->msi_isrcs[irq].isrc, tf) != 0) {
+			pci_dw_msi_set_mask(sc, irq, true);
+			device_printf(sc->dev, "Stray MSI %u disabled\n", irq);
+		}
+	}
+	return (FILTER_HANDLED);
+}
+
+static void
+pci_dw_msi_addr_cb(void *arg, bus_dma_segment_t *segs, int nsegs, int error)
+{
+
+	if (error == 0)
+		*(bus_addr_t *)arg = segs[0].ds_addr;
+}
+
+static int
+pci_dw_msi_attach(struct pci_dw_softc *sc)
+{
+	const char *name;
+	int i, rid, rv;
+
+	if (OF_hasprop(sc->node, "msi-parent") ||
+	    OF_hasprop(sc->node, "msi-map") ||
+	    ofw_bus_find_string_index(sc->node, "interrupt-names", "msi",
+	    &rid) != 0)
+		return (0);
+
+	sc->msi_irq_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &rid,
+	    RF_ACTIVE);
+	if (sc->msi_irq_res == NULL) {
+		device_printf(sc->dev, "Cannot allocate MSI interrupt\n");
+		return (ENXIO);
+	}
+
+	/*
+	 * The controller consumes the writes, so the memory itself is never
+	 * written; allocating it only keeps the address out of other DMA.
+	 * Stay below 4 GB for devices with 32-bit MSI addresses.
+	 */
+	rv = bus_dma_tag_create(sc->dmat,	/* parent */
+	    sizeof(uint64_t), 0,		/* alignment, bounds */
+	    BUS_SPACE_MAXADDR_32BIT,		/* lowaddr */
+	    BUS_SPACE_MAXADDR,			/* highaddr */
+	    NULL, NULL,				/* filter, filterarg */
+	    sizeof(uint64_t), 1,		/* maxsize, nsegments */
+	    sizeof(uint64_t),			/* maxsegsize */
+	    0,					/* flags */
+	    NULL, NULL,				/* lockfunc, lockarg */
+	    &sc->msi_dmat);
+	if (rv != 0)
+		return (rv);
+	rv = bus_dmamem_alloc(sc->msi_dmat, &sc->msi_vaddr,
+	    BUS_DMA_WAITOK | BUS_DMA_ZERO, &sc->msi_map);
+	if (rv != 0)
+		return (rv);
+	rv = bus_dmamap_load(sc->msi_dmat, sc->msi_map, sc->msi_vaddr,
+	    sizeof(uint64_t), pci_dw_msi_addr_cb, &sc->msi_addr,
+	    BUS_DMA_NOWAIT);
+	if (rv != 0)
+		return (rv);
+
+	mtx_init(&sc->msi_mtx, "pci_dw_msi", NULL, MTX_SPIN);
+	sc->msi_isrcs = malloc(sizeof(*sc->msi_isrcs) * DW_MSI_COUNT,
+	    M_DEVBUF, M_WAITOK | M_ZERO);
+	name = device_get_nameunit(sc->dev);
+	for (i = 0; i < DW_MSI_COUNT; i++) {
+		sc->msi_isrcs[i].irq = i;
+		rv = intr_isrc_register(&sc->msi_isrcs[i].isrc, sc->dev, 0,
+		    "%s,%d", name, i);
+		if (rv != 0)
+			return (rv);
+	}
+	sc->msi_xref = OF_xref_from_node(sc->node);
+	rv = intr_msi_register(sc->dev, sc->msi_xref);
+	if (rv != 0)
+		return (rv);
+
+	sc->msi_mask = ~0u;
+	DBI_WR4(sc, DW_MSI_INTR0_MASK, sc->msi_mask);
+	DBI_WR4(sc, DW_MSI_INTR0_ENABLE, ~0u);
+	DBI_WR4(sc, DW_MSI_ADDR_LO, (uint32_t)sc->msi_addr);
+	DBI_WR4(sc, DW_MSI_ADDR_HI, (uint32_t)(sc->msi_addr >> 32));
+
+	rv = bus_setup_intr(sc->dev, sc->msi_irq_res,
+	    INTR_TYPE_MISC | INTR_MPSAFE, pci_dw_msi_intr, NULL, sc,
+	    &sc->msi_intr_cookie);
+	if (rv != 0) {
+		device_printf(sc->dev, "Cannot setup MSI interrupt\n");
+		return (rv);
+	}
+	sc->msi_internal = true;
+	if (bootverbose)
+		device_printf(sc->dev, "Internal MSI, address %#jx\n",
+		    (uintmax_t)sc->msi_addr);
+	return (0);
+}
+
+static int
+pci_dw_msi_alloc_msi(device_t dev, device_t child, int count, int maxcount,
+    device_t *pic, struct intr_irqsrc **srcs)
+{
+	struct pci_dw_softc *sc;
+	uint32_t bits;
+	int i, irq;
+
+	sc = device_get_softc(dev);
+	if (count > DW_MSI_COUNT || !powerof2(count))
+		return (EINVAL);
+
+	/* Multiple messages take an aligned block: the device sets low bits. */
+	bits = count == 32 ? ~0u : (1u << count) - 1;
+	DW_MSI_LOCK(sc);
+	for (irq = 0; irq < DW_MSI_COUNT; irq += count) {
+		if ((sc->msi_used & (bits << irq)) == 0)
+			break;
+	}
+	if (irq >= DW_MSI_COUNT) {
+		DW_MSI_UNLOCK(sc);
+		return (ENXIO);
+	}
+	sc->msi_used |= bits << irq;
+	DW_MSI_UNLOCK(sc);
+
+	for (i = 0; i < count; i++)
+		srcs[i] = &sc->msi_isrcs[irq + i].isrc;
+	*pic = dev;
+	return (0);
+}
+
+static int
+pci_dw_msi_release_msi(device_t dev, device_t child, int count,
+    struct intr_irqsrc **isrc)
+{
+	struct pci_dw_softc *sc;
+	struct pci_dw_msi_irqsrc *mi;
+	int i;
+
+	sc = device_get_softc(dev);
+	DW_MSI_LOCK(sc);
+	for (i = 0; i < count; i++) {
+		mi = (struct pci_dw_msi_irqsrc *)isrc[i];
+		KASSERT((sc->msi_used & (1u << mi->irq)) != 0,
+		    ("%s: MSI %u not allocated", __func__, mi->irq));
+		sc->msi_used &= ~(1u << mi->irq);
+	}
+	DW_MSI_UNLOCK(sc);
+	return (0);
+}
+
+static int
+pci_dw_msi_alloc_msix(device_t dev, device_t child, device_t *pic,
+    struct intr_irqsrc **isrc)
+{
+
+	return (pci_dw_msi_alloc_msi(dev, child, 1, 1, pic, isrc));
+}
+
+static int
+pci_dw_msi_release_msix(device_t dev, device_t child, struct intr_irqsrc *isrc)
+{
+
+	return (pci_dw_msi_release_msi(dev, child, 1, &isrc));
+}
+
+static int
+pci_dw_msi_map_msi(device_t dev, device_t child, struct intr_irqsrc *isrc,
+    uint64_t *addr, uint32_t *data)
+{
+	struct pci_dw_softc *sc;
+
+	sc = device_get_softc(dev);
+	*addr = sc->msi_addr;
+	*data = ((struct pci_dw_msi_irqsrc *)isrc)->irq;
+	return (0);
+}
+
+static void
+pci_dw_msi_enable_intr(device_t dev, struct intr_irqsrc *isrc)
+{
+
+	pci_dw_msi_set_mask(device_get_softc(dev),
+	    ((struct pci_dw_msi_irqsrc *)isrc)->irq, false);
+}
+
+static void
+pci_dw_msi_disable_intr(device_t dev, struct intr_irqsrc *isrc)
+{
+
+	pci_dw_msi_set_mask(device_get_softc(dev),
+	    ((struct pci_dw_msi_irqsrc *)isrc)->irq, true);
+}
+
+/* Messages are edge events, acknowledged in pci_dw_msi_intr(). */
+static void
+pci_dw_msi_post_filter(device_t dev, struct intr_irqsrc *isrc)
+{
+}
+
+static void
+pci_dw_msi_pre_ithread(device_t dev, struct intr_irqsrc *isrc)
+{
+}
+
+static void
+pci_dw_msi_post_ithread(device_t dev, struct intr_irqsrc *isrc)
+{
+}
+
+static int
+pci_dw_msi_parent(device_t pci, device_t child, phandle_t *msi_parent)
+{
+	struct pci_dw_softc *sc;
+
+	sc = device_get_softc(pci);
+	if (sc->msi_internal) {
+		*msi_parent = sc->msi_xref;
+		return (0);
+	}
+	return (ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
+	    msi_parent, NULL));
+}
+
 static int
 pci_dw_alloc_msi(device_t pci, device_t child, int count,
     int maxcount, int *irqs)
@@ -614,8 +885,7 @@ pci_dw_alloc_msi(device_t pci, device_t child, int count,
 	phandle_t msi_parent;
 	int rv;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
-	    &msi_parent, NULL);
+	rv = pci_dw_msi_parent(pci, child, &msi_parent);
 	if (rv != 0)
 		return (rv);
 
@@ -629,8 +899,7 @@ pci_dw_release_msi(device_t pci, device_t child, int count, int *irqs)
 	phandle_t msi_parent;
 	int rv;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
-	    &msi_parent, NULL);
+	rv = pci_dw_msi_parent(pci, child, &msi_parent);
 	if (rv != 0)
 		return (rv);
 	return (intr_release_msi(pci, child, msi_parent, count, irqs));
@@ -643,8 +912,7 @@ pci_dw_map_msi(device_t pci, device_t child, int irq, uint64_t *addr,
 	phandle_t msi_parent;
 	int rv;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
-	    &msi_parent, NULL);
+	rv = pci_dw_msi_parent(pci, child, &msi_parent);
 	if (rv != 0)
 		return (rv);
 
@@ -657,8 +925,7 @@ pci_dw_alloc_msix(device_t pci, device_t child, int *irq)
 	phandle_t msi_parent;
 	int rv;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
-	    &msi_parent, NULL);
+	rv = pci_dw_msi_parent(pci, child, &msi_parent);
 	if (rv != 0)
 		return (rv);
 	return (intr_alloc_msix(pci, child, msi_parent, irq));
@@ -670,8 +937,7 @@ pci_dw_release_msix(device_t pci, device_t child, int irq)
 	phandle_t msi_parent;
 	int rv;
 
-	rv = ofw_bus_msimap(ofw_bus_get_node(pci), pci_get_rid(child),
-	    &msi_parent, NULL);
+	rv = pci_dw_msi_parent(pci, child, &msi_parent);
 	if (rv != 0)
 		return (rv);
 	return (intr_release_msix(pci, child, msi_parent, irq));
@@ -862,6 +1128,10 @@ pci_dw_init(device_t dev)
 	if (rv != 0)
 		goto out;
 
+	rv = pci_dw_msi_attach(sc);
+	if (rv != 0)
+		goto out;
+
 	device_add_child(dev, "pci", DEVICE_UNIT_ANY);
 
 	return (0);
@@ -883,6 +1153,20 @@ static device_method_t pci_dw_methods[] = {
 	DEVMETHOD(pcib_release_msix,	pci_dw_release_msix),
 	DEVMETHOD(pcib_map_msi,		pci_dw_map_msi),
 	DEVMETHOD(pcib_get_id,		pci_dw_get_id),
+
+	/* MSI interface */
+	DEVMETHOD(msi_alloc_msi,	pci_dw_msi_alloc_msi),
+	DEVMETHOD(msi_release_msi,	pci_dw_msi_release_msi),
+	DEVMETHOD(msi_alloc_msix,	pci_dw_msi_alloc_msix),
+	DEVMETHOD(msi_release_msix,	pci_dw_msi_release_msix),
+	DEVMETHOD(msi_map_msi,		pci_dw_msi_map_msi),
+
+	/* Interrupt controller interface */
+	DEVMETHOD(pic_enable_intr,	pci_dw_msi_enable_intr),
+	DEVMETHOD(pic_disable_intr,	pci_dw_msi_disable_intr),
+	DEVMETHOD(pic_post_filter,	pci_dw_msi_post_filter),
+	DEVMETHOD(pic_pre_ithread,	pci_dw_msi_pre_ithread),
+	DEVMETHOD(pic_post_ithread,	pci_dw_msi_post_ithread),
 
 	/* OFW bus interface */
 	DEVMETHOD(ofw_bus_get_compat,	ofw_bus_gen_get_compat),

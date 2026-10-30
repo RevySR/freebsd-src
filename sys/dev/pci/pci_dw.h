@@ -57,6 +57,7 @@
 #define DW_MSI_INTR0_ENABLE		0x828
 #define DW_MSI_INTR0_MASK		0x82C
 #define DW_MSI_INTR0_STATUS		0x830
+#define	DW_MSI_COUNT			32	/* Vectors used, one block */
 
 #define	DW_MISC_CONTROL_1		0x8BC
 #define	 DBI_RO_WR_EN				(1 << 0)
@@ -127,6 +128,20 @@ struct pci_dw_softc {
 	u_int 			bus_end;
 	u_int 			root_bus;
 	u_int 			sub_bus;
+
+	/* Internal MSI controller, if used */
+	bool			msi_internal;
+	intptr_t		msi_xref;
+	struct pci_dw_msi_irqsrc *msi_isrcs;
+	struct resource		*msi_irq_res;
+	void			*msi_intr_cookie;
+	struct mtx		msi_mtx;
+	uint32_t		msi_used;
+	uint32_t		msi_mask;
+	bus_dma_tag_t		msi_dmat;
+	bus_dmamap_t		msi_map;
+	void			*msi_vaddr;
+	bus_addr_t		msi_addr;
 };
 
 DECLARE_CLASS(pci_dw_driver);
