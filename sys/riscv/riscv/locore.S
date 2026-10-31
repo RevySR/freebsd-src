@@ -230,6 +230,12 @@ pagetables:
 	or	s2, s2, t0
 	sfence.vma
 	csrw	satp, s2
+	/*
+	 * If we were entered with translation on, the hart may keep using
+	 * the old mapping for this page, and the fault that takes us to
+	 * 'va' would never come.
+	 */
+	sfence.vma
 
 	.align 2
 va:
